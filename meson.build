@@ -3836,6 +3836,7 @@ io = declare_dependency(objects: libio.extract_all_objects(recursive: false),
                         dependencies: [io_ss.dependencies(), crypto, qom])
 
 libmigration = static_library('migration', sources: migration_files + genh,
+                              dependencies: [zlib],
                               pic: true,
                               gnu_symbol_visibility: 'hidden',
                               build_by_default: false)
