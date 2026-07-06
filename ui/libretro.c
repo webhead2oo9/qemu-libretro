@@ -618,15 +618,25 @@ void vreport(report_type type, const char *fmt, va_list ap)
 
 	fprintf(stderr, "%s\n", msg);
 
-	cb_env(RETRO_ENVIRONMENT_SET_MESSAGE_EXT,
-	       &(struct retro_message_ext){
-		       .msg = msg,
-		       .duration = duration,
-		       .priority = 0,
-		       .level = level,
-		       .target = RETRO_MESSAGE_TARGET_ALL,
-		       .type = RETRO_MESSAGE_TYPE_NOTIFICATION,
-	       });
+	bool shown = cb_env(RETRO_ENVIRONMENT_SET_MESSAGE_EXT,
+			    &(struct retro_message_ext){
+				    .msg = msg,
+				    .duration = duration,
+				    .priority = 0,
+				    .level = level,
+				    .target = RETRO_MESSAGE_TARGET_ALL,
+				    .type = RETRO_MESSAGE_TYPE_NOTIFICATION,
+			    });
+	if (!shown) {
+		// SET_MESSAGE_EXT needs RetroArch 1.9+; older ones ship 1.7.5,
+		// so fall back to the original message API (duration is in
+		// frames, assume 60 fps).
+		cb_env(RETRO_ENVIRONMENT_SET_MESSAGE,
+		       &(struct retro_message){
+			       .msg = msg,
+			       .frames = duration * 60 / 1000,
+		       });
+	}
 
 	g_free(msg);
 
@@ -747,7 +757,10 @@ bool retro_load_game(const struct retro_game_info *game)
 		return false;
 	}
 
-	game_path = game->path;
+	// The frontend only guarantees game->path stays valid during this
+	// call, and old frontends (RetroArch 1.7.5-era) reuse the
+	// string quickly, so copy it before the emu thread reads it.
+	game_path = g_strdup(game->path);
 	pthread_create(&emu_thread, NULL, emu_thread_fn, NULL);
 	return true;
 }
