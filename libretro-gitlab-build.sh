@@ -85,7 +85,12 @@ case "$platform" in
                 EXTRA_CONFIGURE_ARGS=("--cross-prefix=i686-w64-mingw32.static-")
                 ;;
             win64)
-                EXTRA_CONFIGURE_ARGS=("--cross-prefix=x86_64-w64-mingw32.static-")
+                # WHPX: hardware virtualization on Windows hosts; the core
+                # falls back to TCG at runtime when it isn't available.
+                EXTRA_CONFIGURE_ARGS=(
+                    "--cross-prefix=x86_64-w64-mingw32.static-"
+                    "--enable-whpx"
+                )
                 ;;
         esac
         ;;
@@ -154,7 +159,9 @@ rm -rf build
 mkdir build
 cd build
 
-CFLAGS="-Os -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
+# -O2 rather than -Os: emulation-heavy paths (softmmu, device models) are
+# measurably faster optimized for speed.
+CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
     --target-list="aarch64-softmmu alpha-softmmu arm-softmmu i386-softmmu m68k-softmmu mips64el-softmmu mips64-softmmu mipsel-softmmu mips-softmmu ppc64-softmmu ppc-softmmu riscv32-softmmu riscv64-softmmu s390x-softmmu sparc64-softmmu sparc-softmmu x86_64-softmmu" \
     --without-default-features \
     --glib=internal \
