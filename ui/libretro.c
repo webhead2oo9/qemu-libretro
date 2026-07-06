@@ -36,6 +36,11 @@ static pthread_t emu_thread;
 static DisplaySurface *surface;
 static QKbdState *kbd;
 static bool exited = false;
+static bool emu_thread_started = false;
+static bool emu_thread_joined = false;
+// Set when the frontend wants the emu thread gone; stops it from parking in
+// the frame handshake so a shutdown request can be processed.
+static bool unloading = false;
 
 static HWVoiceOut *hw_voice_out = NULL;
 static pthread_mutex_t hw_voice_out_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -201,7 +206,10 @@ static void switch_to_emu_thread(void)
 	pthread_mutex_lock(&main_mutex);
 	pthread_cond_signal(&emu_cv);
 	main_waiting = true;
-	while (main_waiting) {
+	// The emu thread may exit at any point (including before we start
+	// waiting); checking exited under the mutex avoids waiting for a
+	// wakeup that already happened.
+	while (main_waiting && !exited) {
 		pthread_cond_wait(&main_cv, &main_mutex);
 	}
 	pthread_mutex_unlock(&main_mutex);
@@ -216,7 +224,10 @@ static void switch_to_main_thread(void)
 	pthread_mutex_lock(&emu_mutex);
 	pthread_cond_signal(&main_cv);
 	emu_waiting = true;
-	while (emu_waiting) {
+	// Don't park while the frontend is tearing us down: it already sent
+	// its final wakeup, and waiting here would deadlock against its
+	// pthread_join.
+	while (emu_waiting && !unloading) {
 		pthread_cond_wait(&emu_cv, &emu_mutex);
 	}
 	pthread_mutex_unlock(&emu_mutex);
@@ -225,8 +236,17 @@ static void switch_to_main_thread(void)
 // Wait for emu thread to exit
 static void join_emu_thread(void)
 {
-	// Resume thread
+	// The frontend joins both when the guest powers off (retro_run sees
+	// exited) and again from retro_unload_game; a second join would be
+	// use-after-free of the thread handle.
+	if (!emu_thread_started || emu_thread_joined) {
+		return;
+	}
+	emu_thread_joined = true;
+
+	// Resume thread and keep it from parking again
 	pthread_mutex_lock(&emu_mutex);
+	unloading = true;
 	emu_waiting = false;
 	pthread_mutex_unlock(&emu_mutex);
 	pthread_cond_signal(&emu_cv);
@@ -237,13 +257,16 @@ static void join_emu_thread(void)
 
 static void emu_thread_exit(void)
 {
-	exited = true;
-
+	// Post-cleanup only: this runs on the emu thread itself, either after
+	// qemu_default_main returned (block layer already flushed) or before
+	// QEMU started. It must never run mid-emulation — killing worker
+	// threads mid-write corrupts guest disks.
 	if (target_arch && arch_is_valid(target_arch)) {
 		CALL_QEMU_FUNC(qemu_thread_kill_all);
 	}
 
 	pthread_mutex_lock(&main_mutex);
+	exited = true;
 	main_waiting = false;
 	pthread_mutex_unlock(&main_mutex);
 	pthread_cond_signal(&main_cv);
@@ -284,8 +307,10 @@ static struct retro_system_av_info av_info = {
 		.aspect_ratio = 0.0,
 	},
 	.timing = {
-		.fps = 0.0,
-		.sample_rate = 0.0,
+		// Frontends divide by these for pacing before the emu thread
+		// has reported real values; zeroes break RetroArch 1.7.x.
+		.fps = 60.0,
+		.sample_rate = 44100.0,
 	},
 };
 
@@ -640,9 +665,11 @@ void vreport(report_type type, const char *fmt, va_list ap)
 
 	g_free(msg);
 
-	if (level == RETRO_LOG_ERROR) {
-		emu_thread_exit();
-	}
+	// Deliberately non-fatal: QEMU calls error_report() for plenty of
+	// recoverable conditions (failed device emulation, bad options, I/O
+	// hiccups). Tearing down the emulator from here — especially from a
+	// vcpu or worker thread — kills threads mid-write and corrupts guest
+	// disks. Fatal paths must opt in explicitly (early_error_report).
 }
 
 G_GNUC_PRINTF(1, 2)
@@ -653,6 +680,10 @@ static void early_error_report(const char *fmt, ...)
 	va_start(ap, fmt);
 	vreport(REPORT_TYPE_ERROR, fmt, ap);
 	va_end(ap);
+
+	// Only used on the emu thread before/instead of running QEMU; exit
+	// so the frontend's handshake is released instead of hanging.
+	emu_thread_exit();
 }
 
 static void start_qemu_with_args(const char *argv[])
@@ -709,7 +740,9 @@ static void *emu_thread_fn(void *arg)
 
 	if (g_str_has_suffix(game_path, ".qemu_cmd_line")) {
 		char *cmd_line = NULL;
-		GError *error;
+		// Must start NULL: GLib only stores into a NULL GError*, and
+		// the error paths below dereference it.
+		GError *error = NULL;
 		bool success =
 			g_file_get_contents(game_path, &cmd_line, NULL, &error);
 		if (!success) {
@@ -761,7 +794,10 @@ bool retro_load_game(const struct retro_game_info *game)
 	// call, and old frontends (RetroArch 1.7.5-era) reuse the
 	// string quickly, so copy it before the emu thread reads it.
 	game_path = g_strdup(game->path);
-	pthread_create(&emu_thread, NULL, emu_thread_fn, NULL);
+	if (pthread_create(&emu_thread, NULL, emu_thread_fn, NULL) != 0) {
+		return false;
+	}
+	emu_thread_started = true;
 	return true;
 }
 
@@ -774,7 +810,10 @@ bool retro_load_game_special(unsigned game_type,
 
 void retro_unload_game(void)
 {
-	if (!exited) {
+	// target_arch is set by the emu thread just before QEMU starts; if
+	// it's still NULL there is no QEMU instance to ask for shutdown (and
+	// the per-target dispatch can't handle NULL).
+	if (!exited && target_arch) {
 		// Request shutdown
 		CALL_QEMU_FUNC(qemu_system_shutdown_request,
 			       SHUTDOWN_CAUSE_HOST_UI);
