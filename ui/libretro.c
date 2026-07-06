@@ -522,6 +522,13 @@ static void gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h)
 
 static void gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
 {
+	// The console can drop its surface at teardown; forget the old
+	// pointer instead of copying from freed memory in the next refresh.
+	if (!new_surface) {
+		surface = NULL;
+		return;
+	}
+
 	int w = surface_width(new_surface);
 	int h = surface_height(new_surface);
 	bool changed_resolution = !surface || !(surface_width(surface) == w &&
