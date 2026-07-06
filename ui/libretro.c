@@ -38,15 +38,15 @@ static QKbdState *kbd;
 static bool exited = false;
 static bool emu_thread_started = false;
 static bool emu_thread_joined = false;
-// Set when the frontend wants the emu thread gone; stops it from parking in
-// the frame handshake so a shutdown request can be processed.
-static bool unloading = false;
 
 static HWVoiceOut *hw_voice_out = NULL;
 static pthread_mutex_t hw_voice_out_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Input
-#define KEY_EVENT_QUEUE_LEN 32
+// Input. Written by the frontend thread (retro_run / keyboard callback),
+// consumed by the emu thread (refresh); the two run concurrently, so all
+// access goes through input_mutex. Mouse deltas accumulate because the two
+// sides tick at independent rates.
+#define KEY_EVENT_QUEUE_LEN 64
 struct key_event {
 	bool down;
 	QKeyCode key;
@@ -55,14 +55,30 @@ static struct key_event key_event_queue[KEY_EVENT_QUEUE_LEN];
 static size_t num_pending_keys = 0;
 static int mouse_dx, mouse_dy;
 static bool buttons_down[INPUT_BUTTON__MAX];
+static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Synchronization
-static bool emu_waiting = false;
-static bool main_waiting = true;
-static pthread_cond_t emu_cv = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t main_cv = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t emu_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t main_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Video. QEMU runs free; the emu thread copies each finished frame here and
+// retro_run presents the latest one. This replaces an older design that ran
+// the two threads in lockstep, which throttled the guest to the frontend's
+// frame rate and stalled I/O handling (the emu thread used to park holding
+// the BQL between frames).
+static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *frame_buf;
+static int frame_w, frame_h;
+static bool frame_valid = false;   // a frame has been copied at least once
+static bool frame_updated = false; // new content since the last present
+
+// Notifications. QEMU reports errors from arbitrary threads, but libretro
+// environment calls are only safe from the frontend thread, so messages
+// queue here and retro_run delivers them.
+#define PENDING_MSGS_LEN 8
+static pthread_mutex_t msg_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct pending_msg {
+	char *msg;
+	unsigned duration;
+	enum retro_log_level level;
+} pending_msgs[PENDING_MSGS_LEN];
+static size_t num_pending_msgs = 0;
 
 static const QKeyCode key_map[RETROK_LAST] = {
 #define KEY(q, r) [RETROK_##r] = Q_KEY_CODE_##q
@@ -197,42 +213,6 @@ static const QKeyCode key_map[RETROK_LAST] = {
 #undef KEY
 };
 
-static void switch_to_emu_thread(void)
-{
-	pthread_mutex_lock(&emu_mutex);
-	emu_waiting = false;
-	pthread_mutex_unlock(&emu_mutex);
-
-	pthread_mutex_lock(&main_mutex);
-	pthread_cond_signal(&emu_cv);
-	main_waiting = true;
-	// The emu thread may exit at any point (including before we start
-	// waiting); checking exited under the mutex avoids waiting for a
-	// wakeup that already happened.
-	while (main_waiting && !exited) {
-		pthread_cond_wait(&main_cv, &main_mutex);
-	}
-	pthread_mutex_unlock(&main_mutex);
-}
-
-static void switch_to_main_thread(void)
-{
-	pthread_mutex_lock(&main_mutex);
-	main_waiting = false;
-	pthread_mutex_unlock(&main_mutex);
-
-	pthread_mutex_lock(&emu_mutex);
-	pthread_cond_signal(&main_cv);
-	emu_waiting = true;
-	// Don't park while the frontend is tearing us down: it already sent
-	// its final wakeup, and waiting here would deadlock against its
-	// pthread_join.
-	while (emu_waiting && !unloading) {
-		pthread_cond_wait(&emu_cv, &emu_mutex);
-	}
-	pthread_mutex_unlock(&emu_mutex);
-}
-
 // Wait for emu thread to exit
 static void join_emu_thread(void)
 {
@@ -244,14 +224,6 @@ static void join_emu_thread(void)
 	}
 	emu_thread_joined = true;
 
-	// Resume thread and keep it from parking again
-	pthread_mutex_lock(&emu_mutex);
-	unloading = true;
-	emu_waiting = false;
-	pthread_mutex_unlock(&emu_mutex);
-	pthread_cond_signal(&emu_cv);
-
-	// Wait for thread to exit
 	pthread_join(emu_thread, NULL);
 }
 
@@ -265,11 +237,7 @@ static void emu_thread_exit(void)
 		CALL_QEMU_FUNC(qemu_thread_kill_all);
 	}
 
-	pthread_mutex_lock(&main_mutex);
 	exited = true;
-	main_waiting = false;
-	pthread_mutex_unlock(&main_mutex);
-	pthread_cond_signal(&main_cv);
 
 	pthread_exit(NULL);
 }
@@ -322,10 +290,6 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 static void keyboard_event(bool down, unsigned keycode, uint32_t character,
 			   uint16_t key_modifiers)
 {
-	g_assert(num_pending_keys <= KEY_EVENT_QUEUE_LEN);
-	if (num_pending_keys == KEY_EVENT_QUEUE_LEN) {
-		return;
-	}
 	if (keycode >= RETROK_LAST) {
 		return;
 	}
@@ -333,10 +297,20 @@ static void keyboard_event(bool down, unsigned keycode, uint32_t character,
 	if (!qc) {
 		return;
 	}
+
+	pthread_mutex_lock(&input_mutex);
+	if (num_pending_keys == KEY_EVENT_QUEUE_LEN) {
+		// Drop the oldest event rather than the newest: dropping a
+		// key-up leaves the guest with a stuck key.
+		memmove(&key_event_queue[0], &key_event_queue[1],
+			(KEY_EVENT_QUEUE_LEN - 1) * sizeof(key_event_queue[0]));
+		num_pending_keys--;
+	}
 	key_event_queue[num_pending_keys++] = (struct key_event){
 		.down = down,
 		.key = qc,
 	};
+	pthread_mutex_unlock(&input_mutex);
 }
 
 static retro_audio_sample_t cb_audio_sample;
@@ -355,29 +329,48 @@ void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb)
 
 static void audio_callback(void)
 {
-	pthread_mutex_lock(&hw_voice_out_mutex);
+	// Copy samples out under the lock but call the frontend without it:
+	// holding the voice mutex across cb_audio_sample_batch stalls the emu
+	// thread's audio timer (and with it the whole machine) whenever the
+	// frontend blocks, e.g. while paused with a full audio buffer. Short
+	// writes are allowed by the API; the remainder stays pending.
+	for (;;) {
+		int16_t chunk[1024];
+		size_t chunk_len = 0;
 
-	if (!hw_voice_out) {
-		goto out;
+		pthread_mutex_lock(&hw_voice_out_mutex);
+		if (hw_voice_out && hw_voice_out->pending_emul) {
+			size_t start = audio_ring_posb(
+				hw_voice_out->pos_emul,
+				hw_voice_out->pending_emul,
+				hw_voice_out->size_emul);
+			g_assert(start < hw_voice_out->size_emul);
+			chunk_len = MIN(hw_voice_out->pending_emul,
+					hw_voice_out->size_emul - start);
+			chunk_len = MIN(chunk_len, sizeof(chunk)) & ~3;
+			memcpy(chunk, hw_voice_out->buf_emul + start,
+			       chunk_len);
+		}
+		pthread_mutex_unlock(&hw_voice_out_mutex);
+
+		if (chunk_len == 0) {
+			break;
+		}
+
+		size_t written = cb_audio_sample_batch(chunk, chunk_len / 4);
+
+		pthread_mutex_lock(&hw_voice_out_mutex);
+		if (hw_voice_out) {
+			hw_voice_out->pending_emul -=
+				MIN(written * 4, hw_voice_out->pending_emul);
+		}
+		pthread_mutex_unlock(&hw_voice_out_mutex);
+
+		if (written * 4 < chunk_len) {
+			// Frontend buffer is full; try again next callback.
+			break;
+		}
 	}
-
-	while (hw_voice_out->pending_emul) {
-		size_t start = audio_ring_posb(hw_voice_out->pos_emul,
-					       hw_voice_out->pending_emul,
-					       hw_voice_out->size_emul);
-		g_assert(start < hw_voice_out->size_emul);
-		size_t write_len = MIN(hw_voice_out->pending_emul,
-				       hw_voice_out->size_emul - start);
-
-		size_t written = cb_audio_sample_batch(
-			hw_voice_out->buf_emul + start, write_len / 4);
-		g_assert(hw_voice_out->pending_emul >= written * 4);
-		hw_voice_out->pending_emul -= written * 4;
-		g_assert(write_len == written * 4);
-	}
-
-out:
-	pthread_mutex_unlock(&hw_voice_out_mutex);
 }
 
 static retro_environment_t cb_env;
@@ -436,7 +429,9 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
 
 void retro_reset(void)
 {
-	if (!exited) {
+	// target_arch is NULL until the emu thread starts QEMU; the
+	// per-target dispatch can't handle that.
+	if (!exited && target_arch) {
 		CALL_QEMU_FUNC(qemu_system_reset_request,
 			       SHUTDOWN_CAUSE_HOST_UI);
 	}
@@ -454,8 +449,11 @@ static void audio_fini(void *opaque)
 static int audio_init_out(HWVoiceOut *hw, struct audsettings *as,
 			  void *drv_opaque)
 {
-	g_assert(as->fmt == AUDIO_FORMAT_S16);
-	g_assert(as->nchannels == 2);
+	// The frontend consumes S16 stereo only; fail the voice rather than
+	// abort the process on other configurations.
+	if (as->fmt != AUDIO_FORMAT_S16 || as->nchannels != 2) {
+		return -1;
+	}
 
 	pthread_mutex_lock(&av_info_lock);
 	av_info.timing.sample_rate = as->freq;
@@ -488,10 +486,9 @@ static void audio_enable_out(HWVoiceOut *hw, bool enable)
 
 static size_t audio_write(HWVoiceOut *hw, void *buf, size_t size)
 {
-	pthread_mutex_lock(&hw_voice_out_mutex);
-	size_t ret = CALL_QEMU_FUNC(audio_generic_write, hw, buf, size);
-	pthread_mutex_unlock(&hw_voice_out_mutex);
-	return ret;
+	// No lock here: audio_generic_write calls back into get_buffer_out /
+	// put_buffer_out below, which take the (non-recursive) mutex.
+	return CALL_QEMU_FUNC(audio_generic_write, hw, buf, size);
 }
 
 static size_t audio_buffer_get_free(HWVoiceOut *hw)
@@ -549,29 +546,63 @@ static void refresh(DisplayChangeListener *dcl)
 {
 	CALL_QEMU_FUNC(graphic_hw_update, dcl->con);
 
-	switch_to_main_thread();
+	// Publish the frame: copy it out so the frontend can present it
+	// while QEMU keeps running. This runs on the emu thread under the
+	// BQL, so the copy must be the only thing the frontend can wait on.
+	if (surface) {
+		int w = surface_width(surface);
+		int h = surface_height(surface);
+		int stride = surface_stride(surface);
+		uint8_t *src = surface_data(surface);
 
-	// Flush keyboard event queue
+		pthread_mutex_lock(&frame_mutex);
+		if (!frame_buf || frame_w != w || frame_h != h) {
+			frame_buf = g_realloc(frame_buf, (size_t)w * h * 4);
+			frame_w = w;
+			frame_h = h;
+		}
+		if (stride == w * 4) {
+			memcpy(frame_buf, src, (size_t)w * h * 4);
+		} else {
+			for (int y = 0; y < h; y++) {
+				memcpy(frame_buf + (size_t)y * w * 4,
+				       src + (size_t)y * stride, w * 4);
+			}
+		}
+		frame_valid = true;
+		frame_updated = true;
+		pthread_mutex_unlock(&frame_mutex);
+	}
+
+	// Inject input collected by the frontend since the last refresh.
+	pthread_mutex_lock(&input_mutex);
+
 	for (size_t i = 0; i < num_pending_keys; i++) {
 		CALL_QEMU_FUNC(qkbd_state_key_event, kbd,
 			       key_event_queue[i].key, key_event_queue[i].down);
 	}
 	num_pending_keys = 0;
 
-	// Update mouse
 	CALL_QEMU_FUNC(qemu_input_queue_rel, dcl->con, INPUT_AXIS_X, mouse_dx);
 	CALL_QEMU_FUNC(qemu_input_queue_rel, dcl->con, INPUT_AXIS_Y, mouse_dy);
+	mouse_dx = 0;
+	mouse_dy = 0;
 
-	// Update buttons
 	for (size_t i = 0; i < INPUT_BUTTON__MAX; i++) {
 		CALL_QEMU_FUNC(qemu_input_queue_btn, dcl->con, i,
 			       buttons_down[i]);
 	}
 
+	pthread_mutex_unlock(&input_mutex);
+
 	CALL_QEMU_FUNC(qemu_input_event_sync);
 }
 
 static DisplayChangeListener dcl = {
+	// Refresh at ~60 Hz instead of QEMU's 30 ms default; the frontend
+	// presents whatever frame is latest, so this only sets guest-side
+	// display smoothness.
+	.update_interval = 16,
 	.ops = (DisplayChangeListenerOps[]){ {
 		.dpy_name = "libretro",
 		.dpy_gfx_update = gfx_update,
@@ -643,25 +674,19 @@ void vreport(report_type type, const char *fmt, va_list ap)
 
 	fprintf(stderr, "%s\n", msg);
 
-	bool shown = cb_env(RETRO_ENVIRONMENT_SET_MESSAGE_EXT,
-			    &(struct retro_message_ext){
-				    .msg = msg,
-				    .duration = duration,
-				    .priority = 0,
-				    .level = level,
-				    .target = RETRO_MESSAGE_TARGET_ALL,
-				    .type = RETRO_MESSAGE_TYPE_NOTIFICATION,
-			    });
-	if (!shown) {
-		// SET_MESSAGE_EXT needs RetroArch 1.9+; older ones ship 1.7.5,
-		// so fall back to the original message API (duration is in
-		// frames, assume 60 fps).
-		cb_env(RETRO_ENVIRONMENT_SET_MESSAGE,
-		       &(struct retro_message){
-			       .msg = msg,
-			       .frames = duration * 60 / 1000,
-		       });
+	// This can be called from any QEMU thread, but libretro environment
+	// calls are only safe on the frontend thread — queue the message for
+	// retro_run to deliver.
+	pthread_mutex_lock(&msg_mutex);
+	if (num_pending_msgs < PENDING_MSGS_LEN) {
+		pending_msgs[num_pending_msgs++] = (struct pending_msg){
+			.msg = msg,
+			.duration = duration,
+			.level = level,
+		};
+		msg = NULL;
 	}
+	pthread_mutex_unlock(&msg_mutex);
 
 	g_free(msg);
 
@@ -670,6 +695,42 @@ void vreport(report_type type, const char *fmt, va_list ap)
 	// hiccups). Tearing down the emulator from here — especially from a
 	// vcpu or worker thread — kills threads mid-write and corrupts guest
 	// disks. Fatal paths must opt in explicitly (early_error_report).
+}
+
+// Deliver queued vreport messages; frontend thread only.
+static void flush_pending_messages(void)
+{
+	struct pending_msg local[PENDING_MSGS_LEN];
+	size_t n;
+
+	pthread_mutex_lock(&msg_mutex);
+	n = num_pending_msgs;
+	memcpy(local, pending_msgs, n * sizeof(local[0]));
+	num_pending_msgs = 0;
+	pthread_mutex_unlock(&msg_mutex);
+
+	for (size_t i = 0; i < n; i++) {
+		bool shown = cb_env(RETRO_ENVIRONMENT_SET_MESSAGE_EXT,
+				    &(struct retro_message_ext){
+					    .msg = local[i].msg,
+					    .duration = local[i].duration,
+					    .priority = 0,
+					    .level = local[i].level,
+					    .target = RETRO_MESSAGE_TARGET_ALL,
+					    .type = RETRO_MESSAGE_TYPE_NOTIFICATION,
+				    });
+		if (!shown) {
+			// SET_MESSAGE_EXT needs RetroArch 1.9+; older ones ship
+			// 1.7.5, so fall back to the original message API
+			// (duration is in frames, assume 60 fps).
+			cb_env(RETRO_ENVIRONMENT_SET_MESSAGE,
+			       &(struct retro_message){
+				       .msg = local[i].msg,
+				       .frames = local[i].duration * 60 / 1000,
+			       });
+		}
+		g_free(local[i].msg);
+	}
 }
 
 G_GNUC_PRINTF(1, 2)
@@ -840,10 +901,12 @@ void retro_run(void)
 {
 	cb_input_poll();
 
-	mouse_dx = cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
-				  RETRO_DEVICE_ID_MOUSE_X);
-	mouse_dy = cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
-				  RETRO_DEVICE_ID_MOUSE_Y);
+	pthread_mutex_lock(&input_mutex);
+	// Deltas accumulate: the emu thread consumes them at its own rate.
+	mouse_dx += cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
+				   RETRO_DEVICE_ID_MOUSE_X);
+	mouse_dy += cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
+				   RETRO_DEVICE_ID_MOUSE_Y);
 
 #define BTN(q, r)                                                              \
 	buttons_down[INPUT_BUTTON_##q] = cb_input_state(                       \
@@ -854,23 +917,15 @@ void retro_run(void)
 	BTN(WHEEL_UP, WHEELUP);
 	BTN(WHEEL_DOWN, WHEELDOWN);
 #undef BTN
+	pthread_mutex_unlock(&input_mutex);
+
+	flush_pending_messages();
 
 	if (exited) {
 		join_emu_thread();
 		cb_env(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
 		return;
 	}
-
-	switch_to_emu_thread();
-
-	if (exited) {
-		join_emu_thread();
-		cb_env(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-		return;
-	}
-
-	int w = surface_width(surface);
-	int h = surface_height(surface);
 
 	pthread_mutex_lock(&av_info_lock);
 	if (changed_av_info) {
@@ -879,5 +934,20 @@ void retro_run(void)
 	}
 	pthread_mutex_unlock(&av_info_lock);
 
-	cb_video_refresh(surface_data(surface), w, h, surface_stride(surface));
+	// Present the latest frame QEMU published; NULL means "same frame as
+	// last time" and lets the frontend skip the upload.
+	pthread_mutex_lock(&frame_mutex);
+	if (frame_valid) {
+		cb_video_refresh(frame_updated ? frame_buf : NULL,
+				 frame_w, frame_h, (size_t)frame_w * 4);
+		frame_updated = false;
+	} else {
+		// Nothing rendered yet (or the config has no libretro
+		// display); present a duped blank frame at the advertised
+		// geometry instead of blocking.
+		cb_video_refresh(NULL, av_info.geometry.base_width,
+				 av_info.geometry.base_height,
+				 (size_t)av_info.geometry.base_width * 4);
+	}
+	pthread_mutex_unlock(&frame_mutex);
 }
