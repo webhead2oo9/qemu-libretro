@@ -67,6 +67,11 @@ static uint8_t *frame_buf;
 static int frame_w, frame_h;
 static bool frame_valid = false;   // a frame has been copied at least once
 static bool frame_updated = false; // new content since the last present
+// While qemu-3dfx pass-through presents (Win98 Glide/GL games), frames
+// come from the readback glue instead of the VGA surface; refresh()
+// stands down so the stale surface cannot overwrite them. Written and
+// read under the BQL only.
+static bool fx_active;
 
 // Notifications. QEMU reports errors from arbitrary threads, but libretro
 // environment calls are only safe from the frontend thread, so messages
@@ -556,7 +561,7 @@ static void refresh(DisplayChangeListener *dcl)
 	// Publish the frame: copy it out so the frontend can present it
 	// while QEMU keeps running. This runs on the emu thread under the
 	// BQL, so the copy must be the only thing the frontend can wait on.
-	if (surface) {
+	if (surface && !fx_active) {
 		int w = surface_width(surface);
 		int h = surface_height(surface);
 		int stride = surface_stride(surface);
@@ -605,6 +610,76 @@ static void refresh(DisplayChangeListener *dcl)
 	CALL_QEMU_FUNC(qemu_input_event_sync);
 }
 
+#ifdef CONFIG_QEMU_3DFX
+// qemu-3dfx frame sink (see ui/libretro-3dfx.c). publish arrives from a
+// vCPU thread under the BQL with the finished 3D frame; rows come
+// bottom-up from glReadPixels and BGRA bytes already match XRGB8888.
+static void fx_sink_publish(const void *pixels, int w, int h)
+{
+	const uint8_t *src = pixels;
+
+	pthread_mutex_lock(&frame_mutex);
+	if (!frame_buf || frame_w != w || frame_h != h) {
+		frame_buf = g_realloc(frame_buf, (size_t)w * h * 4);
+		frame_w = w;
+		frame_h = h;
+	}
+	for (int y = 0; y < h; y++) {
+		memcpy(frame_buf + (size_t)y * w * 4,
+		       src + (size_t)(h - 1 - y) * w * 4, (size_t)w * 4);
+	}
+	frame_valid = true;
+	frame_updated = true;
+	pthread_mutex_unlock(&frame_mutex);
+
+	pthread_mutex_lock(&av_info_lock);
+	if (av_info.geometry.base_width != w ||
+	    av_info.geometry.base_height != h) {
+		av_info.geometry.base_width = av_info.geometry.max_width = w;
+		av_info.geometry.base_height = av_info.geometry.max_height = h;
+		changed_av_info = true;
+	}
+	pthread_mutex_unlock(&av_info_lock);
+}
+
+static void fx_sink_set_active(bool on)
+{
+	fx_active = on;
+
+	// Back to 2D: snap the geometry to the VGA surface so the next
+	// published frame is not presented at the 3D resolution.
+	if (!on && surface) {
+		int w = surface_width(surface);
+		int h = surface_height(surface);
+
+		pthread_mutex_lock(&av_info_lock);
+		if (av_info.geometry.base_width != w ||
+		    av_info.geometry.base_height != h) {
+			av_info.geometry.base_width =
+				av_info.geometry.max_width = w;
+			av_info.geometry.base_height =
+				av_info.geometry.max_height = h;
+			changed_av_info = true;
+		}
+		pthread_mutex_unlock(&av_info_lock);
+	}
+}
+
+static void fx_sink_guest_dims(int *w, int *h)
+{
+	if (surface) {
+		*w = surface_width(surface);
+		*h = surface_height(surface);
+	}
+}
+
+static const QemuFxSink fx_sink = {
+	.publish = fx_sink_publish,
+	.set_active = fx_sink_set_active,
+	.get_guest_dims = fx_sink_guest_dims,
+};
+#endif
+
 static DisplayChangeListener dcl = {
 	// Refresh at ~60 Hz instead of QEMU's 30 ms default; the frontend
 	// presents whatever frame is latest, so this only sets guest-side
@@ -624,6 +699,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
 	dcl.con = CALL_QEMU_FUNC(qemu_console_lookup_by_index, 0);
 	kbd = CALL_QEMU_FUNC(qkbd_state_init, dcl.con);
 	CALL_QEMU_FUNC(register_displaychangelistener, &dcl);
+#ifdef CONFIG_QEMU_3DFX
+	CALL_QEMU_FUNC(qemu_fx_register_sink, &fx_sink);
+#endif
 }
 
 static QemuDisplay display = {

@@ -487,6 +487,28 @@ void mesa_release_window(void);
 void mesa_cursor_define(int, int, int, int, const void *);
 void mesa_mouse_warp(int, int, const int);
 int mesa_gui_fullscreen(int *);
+
+/* called by hw/3dfx and hw/mesa right before their buffer swap, while
+ * the pass-through GL context is current; the glue reads the finished
+ * frame out of the back buffer */
+void glide_swap_notify(void);
+void mesa_swap_notify(void);
+
+/*
+ * Frame sink registered by the display frontend (ui/libretro.c) so the
+ * glue can deliver frames it read out of the pass-through GL context.
+ * All hooks run with the BQL held, on whichever thread the device's
+ * MMIO handler or timer ran on.
+ */
+typedef struct QemuFxSink {
+    /* bottom-up BGRA rows (glReadPixels order), width * height * 4 bytes */
+    void (*publish)(const void *pixels, int width, int height);
+    /* guest entered (true) or left (false) 3D pass-through rendering */
+    void (*set_active)(bool on);
+    /* current guest display size, for sizing the context window */
+    void (*get_guest_dims)(int *width, int *height);
+} QemuFxSink;
+void qemu_fx_register_sink(const QemuFxSink *sink);
 #endif /* CONFIG_QEMU_3DFX */
 
 #ifdef CONFIG_LINUX

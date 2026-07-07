@@ -364,6 +364,7 @@ int MGLSwapBuffers(void)
 {
     MGLActivateHandler(1, 0);
     MesaBlitScale();
+    mesa_swap_notify();     /* qemu-libretro: read the finished frame back */
     return SwapBuffers(hDC);
 }
 

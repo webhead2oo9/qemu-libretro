@@ -22,6 +22,7 @@
 #include "hw/sysbus.h"
 #include "hw/i386/pc.h"
 #include "exec/address-spaces.h"
+#include "ui/console.h"     /* qemu-libretro: glide_swap_notify() */
 
 #include "glide2x_impl.h"
 #include "gllstbuf.h"
@@ -351,6 +352,9 @@ static void processArgs(GlidePTState *s)
                 s->arg[0] = 0;
             DPRINTF_COND((GRFuncTrace() == 2), ">>>>>>>> _grBufferSwap <<<<<<<<");
             s->perfs.stat();
+            /* qemu-libretro: LFB writes are flushed and the wrapper has
+             * not swapped yet; read the finished frame back */
+            glide_swap_notify();
             break;
 	case FEnum_grLfbLock:
             s->datacb = ALIGNED(SIZE_GRLFBINFO);
