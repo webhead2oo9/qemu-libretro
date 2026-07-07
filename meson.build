@@ -970,6 +970,19 @@ elif glib_opt == 'internal'
   ])
   glib = glib_proj.get_variable('libglib_dep')
   gmodule = glib_proj.get_variable('libgmodule_dep')
+
+  # glib's own build registers the 'glib-2.0' override only for static
+  # lookups; subprojects that ask with an explicit static kwarg (libslirp
+  # passes static: false by default) would otherwise fall through to a
+  # pkg-config lookup that cannot succeed here.
+  meson.override_dependency('glib-2.0', glib, static: false)
+
+  if host_os == 'windows'
+    # libslirp requests iconv on Windows only to compensate for pkg-config
+    # static-lib deficiencies; internal glib bundles win_iconv, so the glib
+    # dependency above already carries it.
+    meson.override_dependency('iconv', declare_dependency(), static: false)
+  endif
 endif
 
 # Check whether glib has gslice, which we have to avoid for correctness.
@@ -1183,8 +1196,13 @@ endif
 
 slirp = not_found
 if not get_option('slirp').auto() or have_system
+  # The static subproject build relies on subprojects/packagefiles/
+  # libslirp-static.patch to define LIBSLIRP_STATIC for its own objects;
+  # without it they embed dllexport directives that break the libretro DLL
+  # link.
   slirp = dependency('slirp', required: get_option('slirp'),
-                     method: 'pkg-config')
+                     method: 'pkg-config',
+                     default_options: ['default_library=static'])
   # slirp < 4.7 is incompatible with CFI support in QEMU.  This is because
   # it passes function pointers within libslirp as callbacks for timers.
   # When using a system-wide shared libslirp, the type information for the
@@ -1198,6 +1216,12 @@ if not get_option('slirp').auto() or have_system
       warning('Cannot use libslirp since Control-Flow Integrity requires libslirp >= 4.7.')
       slirp = not_found
     endif
+  endif
+  if slirp.found() and slirp.type_name() == 'internal'
+    # The subproject builds a static libslirp (default_options above), so
+    # consumers must see an empty SLIRP_EXPORT instead of dllimport.
+    slirp = declare_dependency(compile_args: '-DLIBSLIRP_STATIC',
+                               dependencies: slirp)
   endif
 endif
 
@@ -3921,6 +3945,11 @@ if host_os == 'darwin'
 endif
 
 libretro_core_deps = [util_ss.dependencies(), fdt, libm, threads, glib, gmodule, socket, malloc]
+if slirp.found()
+  # arch_deps below are folded in via partial_dependency(), which drops
+  # link_with libraries, so an internal libslirp must be linked explicitly.
+  libretro_core_deps += slirp
+endif
 if get_option('tcg_interpreter')
   libretro_core_deps += dependency(
     'libffi',

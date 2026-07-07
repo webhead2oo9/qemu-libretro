@@ -1,0 +1,18 @@
+diff --git a/meson.build b/meson.build
+index f9f8fa4a..5e16ecbc 100644
+--- a/meson.build
++++ b/meson.build
+@@ -97,6 +97,13 @@ cargs = [
+   '-DBUILDING_LIBSLIRP',
+ ]
+ 
++# LIBSLIRP_STATIC (honored by libslirp.h since 4.8) suppresses
++# dllimport/dllexport on Windows; without it static-library objects embed
++# export directives that leak into any DLL linking them.
++if get_option('default_library') == 'static'
++  cargs += '-DLIBSLIRP_STATIC'
++endif
++
+ if glib_static == true
+   # This likely only applies to Windows... but... need to ensure that
+   # glib-2.0 doesn't set import/export defines.

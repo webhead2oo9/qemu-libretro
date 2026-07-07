@@ -161,6 +161,9 @@ cd build
 
 # -O2 rather than -Os: emulation-heavy paths (softmmu, device models) are
 # measurably faster optimized for speed.
+# --enable-slirp: user-mode NAT networking (-netdev user), which
+# --without-default-features would otherwise drop; wrap_mode=forcefallback
+# builds it statically from subprojects/slirp.wrap.
 CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
     --target-list="aarch64-softmmu alpha-softmmu arm-softmmu i386-softmmu m68k-softmmu mips64el-softmmu mips64-softmmu mipsel-softmmu mips-softmmu ppc64-softmmu ppc-softmmu riscv32-softmmu riscv64-softmmu s390x-softmmu sparc64-softmmu sparc-softmmu x86_64-softmmu" \
     --without-default-features \
@@ -173,6 +176,7 @@ CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
     --enable-libretro \
     --audio-drv-list=libretro \
     --disable-sdl \
+    --enable-slirp \
     -Dwrap_mode=forcefallback \
     ${EXTRA_CONFIGURE_ARGS[@]+"${EXTRA_CONFIGURE_ARGS[@]}"}
 
