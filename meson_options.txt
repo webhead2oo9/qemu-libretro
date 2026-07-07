@@ -246,6 +246,8 @@ option('vnc_sasl', type : 'feature', value : 'auto',
        description: 'SASL authentication for VNC server')
 option('libretro', type : 'feature', value : 'auto',
        description: 'libretro core support')
+option('qemu_3dfx', type : 'feature', value : 'auto',
+       description: '3dfx Glide/MESA GL pass-through (qemu-3dfx)')
 option('vte', type : 'feature', value : 'auto',
        description: 'vte support for the gtk UI')
 

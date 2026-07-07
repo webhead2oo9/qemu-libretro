@@ -33,4 +33,14 @@ extern bool whpx_irqchip_in_kernel;
 #define whpx_irqchip_in_kernel() (0)
 #endif /* !CONFIG_WHPX_IS_POSSIBLE */
 
+#ifdef CONFIG_QEMU_3DFX
+/*
+ * qemu-3dfx (hw/3dfx, hw/mesa): map/unmap a raw host VA range into guest
+ * PA space for the LFB write-merge buffer. The range does not belong to a
+ * MemoryRegion; it comes straight from the pass-through device.
+ */
+void whpx_update_guest_pa_range(uint64_t start_pa, uint64_t size,
+                                void *host_va, int readonly, int add);
+#endif
+
 #endif /* QEMU_WHPX_H */

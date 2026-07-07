@@ -155,6 +155,8 @@ typedef struct QemuUIInfo {
     uint32_t  width;
     uint32_t  height;
     uint32_t  refresh_rate;
+    /* qemu-3dfx pass-through active (suppresses gfx_update) */
+    bool passthrough;
 } QemuUIInfo;
 
 /* cursor data format is 32bit RGBA */
@@ -384,6 +386,7 @@ void graphic_console_set_hwops(QemuConsole *con,
                                void *opaque);
 void graphic_console_close(QemuConsole *con);
 
+void graphic_hw_passthrough(QemuConsole *con, bool passthrough);
 void graphic_hw_update(QemuConsole *con);
 void graphic_hw_update_done(QemuConsole *con);
 void graphic_hw_invalidate(QemuConsole *con);
@@ -466,6 +469,25 @@ bool vnc_display_update(DisplayUpdateOptionsVNC *arg, Error **errp);
 
 /* input.c */
 int index_from_key(const char *key, size_t key_length);
+
+#ifdef CONFIG_QEMU_3DFX
+/*
+ * qemu-3dfx display glue, implemented by ui/libretro-3dfx.c in this fork
+ * (upstream qemu-3dfx implements these in ui/sdl2.c).
+ */
+void glide_prepare_window(uint32_t, int, void *, void *);
+void glide_release_window(void *, void *);
+int glide_window_stat(const int);
+int glide_gui_fullscreen(int *, int *);
+void glide_renderer_stat(const int);
+
+void mesa_renderer_stat(const int);
+void mesa_prepare_window(int, int, int, void *);
+void mesa_release_window(void);
+void mesa_cursor_define(int, int, int, int, const void *);
+void mesa_mouse_warp(int, int, const int);
+int mesa_gui_fullscreen(int *);
+#endif /* CONFIG_QEMU_3DFX */
 
 #ifdef CONFIG_LINUX
 /* udmabuf.c */

@@ -3,6 +3,9 @@ specific_ss.add(when: ['CONFIG_SYSTEM_ONLY'], if_true: pixman)   # for the inclu
 specific_ss.add(when: ['CONFIG_SYSTEM_ONLY'], if_true: opengl)   # for the include path
 
 system_ss.add(png)
+if qemu_3dfx.allowed()
+  system_ss.add(files('libretro-3dfx.c'))
+endif
 system_ss.add(files(
   'clipboard.c',
   'console.c',

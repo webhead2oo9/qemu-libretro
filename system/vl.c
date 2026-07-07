@@ -877,6 +877,16 @@ static void version(void)
            QEMU_COPYRIGHT "\n");
 }
 
+#ifdef CONFIG_QEMU_3DFX
+static void feature(void)
+{
+    /* kept in sync with hw/3dfx/g2xfuncs.h and hw/mesa/mglfuncs.h; the
+     * guest wrappers must be built from the same qemu-3dfx revision */
+    const char rev_[] = "b47f30a-";
+    printf("  featuring qemu-3dfx@%s"__TIME__" "__DATE__" build\n", rev_);
+}
+#endif
+
 static void help(int exitcode)
 {
     version();
@@ -3016,6 +3026,9 @@ void qemu_init(int argc, char **argv)
                 break;
             case QEMU_OPTION_version:
                 version();
+#ifdef CONFIG_QEMU_3DFX
+                feature();
+#endif
                 exit(0);
                 break;
             case QEMU_OPTION_m:

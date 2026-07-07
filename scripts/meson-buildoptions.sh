@@ -170,6 +170,7 @@ meson_options_help() {
   printf "%s\n" '  png             PNG support with libpng'
   printf "%s\n" '  qcow1           qcow1 image format support'
   printf "%s\n" '  qed             qed image format support'
+  printf "%s\n" '  qemu-3dfx       3dfx Glide/MESA GL pass-through (qemu-3dfx)'
   printf "%s\n" '  qga-vss         build QGA VSS support (broken with MinGW)'
   printf "%s\n" '  qpl             Query Processing Library support'
   printf "%s\n" '  rbd             Ceph block device driver'
@@ -439,6 +440,8 @@ _meson_option_parse() {
     --disable-qcow1) printf "%s" -Dqcow1=disabled ;;
     --enable-qed) printf "%s" -Dqed=enabled ;;
     --disable-qed) printf "%s" -Dqed=disabled ;;
+    --enable-qemu-3dfx) printf "%s" -Dqemu_3dfx=enabled ;;
+    --disable-qemu-3dfx) printf "%s" -Dqemu_3dfx=disabled ;;
     --firmwarepath=*) quote_sh "-Dqemu_firmwarepath=$(meson_option_build_array $2)" ;;
     --qemu-ga-distro=*) quote_sh "-Dqemu_ga_distro=$2" ;;
     --qemu-ga-manufacturer=*) quote_sh "-Dqemu_ga_manufacturer=$2" ;;

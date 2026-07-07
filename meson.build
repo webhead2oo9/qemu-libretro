@@ -1910,6 +1910,12 @@ if get_option('libretro').allowed()
   libretro = declare_dependency() # dummy dependency
 endif
 
+# hw/3dfx + hw/mesa resolve host GL at runtime (opengl32.dll), so no link
+# dependency; only the Windows display glue exists in this fork so far.
+qemu_3dfx = get_option('qemu_3dfx') \
+  .require(host_os == 'windows',
+           error_message: 'qemu-3dfx pass-through is only wired up for Windows hosts in this fork')
+
 pam = not_found
 if not get_option('auth_pam').auto() or have_system
   pam = cc.find_library('pam', has_headers: ['security/pam_appl.h'],
@@ -2440,6 +2446,7 @@ config_host_data.set('CONFIG_VNC', vnc.found())
 config_host_data.set('CONFIG_VNC_JPEG', jpeg.found())
 config_host_data.set('CONFIG_VNC_SASL', sasl.found())
 config_host_data.set('CONFIG_LIBRETRO', libretro.found())
+config_host_data.set('CONFIG_QEMU_3DFX', qemu_3dfx.allowed())
 if virgl.found()
   config_host_data.set('HAVE_VIRGL_D3D_INFO_EXT',
                        cc.has_member('struct virgl_renderer_resource_info_ext', 'd3d_tex2d',
@@ -3601,6 +3608,12 @@ if have_system or have_user
                          arguments: ['@INPUT@', '@EXTRA_ARGS@', '-o', '@OUTPUT@'])
   subdir('libdecnumber')
   subdir('target')
+  if qemu_3dfx.allowed()
+    # qemu-3dfx devices add themselves to i386_system_ss, so this must
+    # come after subdir('target'), matching the upstream patch placement.
+    subdir('hw/3dfx')
+    subdir('hw/mesa')
+  endif
 endif
 
 subdir('audio')

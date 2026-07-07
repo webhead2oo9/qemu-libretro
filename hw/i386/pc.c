@@ -60,6 +60,7 @@
 #include "hw/i386/kvm/xen_gnttab.h"
 #include "hw/i386/kvm/xen_xenstore.h"
 #include "hw/mem/memory-device.h"
+#include "hw/sysbus.h"
 #include "e820_memory_layout.h"
 #include "trace.h"
 #include "sev.h"
@@ -1217,10 +1218,35 @@ void pc_basic_device_init(struct PCMachineState *pcms,
         isa_realize_and_unref(pcms->pcspk, isa_bus, &error_fatal);
     }
 
+#ifdef CONFIG_QEMU_3DFX
+    /* Glide pass-through */
+    glidept_mm_init();
+    /* MESA pass-through */
+    mesapt_mm_init();
+#endif
+
     /* Super I/O */
     pc_superio_init(isa_bus, create_fdctrl, pcms->i8042_enabled,
                     pcms->vmport != ON_OFF_AUTO_ON);
 }
+
+#ifdef CONFIG_QEMU_3DFX
+void glidept_mm_init(void)
+{
+    DeviceState *glidept_dev = qdev_new(TYPE_GLIDEPT);
+
+    sysbus_realize(SYS_BUS_DEVICE(glidept_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(glidept_dev), 0, GLIDEPT_MM_BASE);
+}
+
+void mesapt_mm_init(void)
+{
+    DeviceState *mesapt_dev = qdev_new(TYPE_MESAPT);
+
+    sysbus_realize(SYS_BUS_DEVICE(mesapt_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(mesapt_dev), 0, MESAPT_MM_BASE);
+}
+#endif /* CONFIG_QEMU_3DFX */
 
 void pc_nic_init(PCMachineClass *pcmc, ISABus *isa_bus, PCIBus *pci_bus)
 {

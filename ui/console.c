@@ -125,6 +125,11 @@ static void gui_setup_refresh(DisplayState *ds)
     }
 }
 
+void graphic_hw_passthrough(QemuConsole *con, bool passthrough)
+{
+    con->ui_info.passthrough = passthrough;
+}
+
 void graphic_hw_update_done(QemuConsole *con)
 {
     if (con) {
@@ -139,7 +144,10 @@ void graphic_hw_update(QemuConsole *con)
         return;
     }
     if (con->hw_ops->gfx_update) {
-        con->hw_ops->gfx_update(con->hw);
+        /* qemu-3dfx: the pass-through renderer owns the output */
+        if (!con->ui_info.passthrough) {
+            con->hw_ops->gfx_update(con->hw);
+        }
         async = con->hw_ops->gfx_update_async;
     }
     if (!async) {

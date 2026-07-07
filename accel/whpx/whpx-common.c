@@ -333,6 +333,42 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
     }
 }
 
+#ifdef CONFIG_QEMU_3DFX
+/*
+ * qemu-3dfx (hw/3dfx, hw/mesa): map/unmap a raw host VA range into guest
+ * PA space for the LFB write-merge buffer. Unlike whpx_set_phys_mem()
+ * there is no MemoryRegion behind the range, so map it directly. The
+ * upstream qemu-3dfx patch fabricates a stack RAMBlock to funnel this
+ * through the listener path; calling WHvMapGpaRange directly is
+ * equivalent and avoids poking RAMBlock internals.
+ */
+void whpx_update_guest_pa_range(uint64_t start_pa, uint64_t size,
+                                void *host_va, int readonly, int add)
+{
+    struct whpx_state *whpx = &whpx_global;
+    uint64_t aligned_size = ROUND_UP(size, qemu_real_host_page_size());
+    HRESULT hr;
+
+    if (!add) {
+        hr = whp_dispatch.WHvUnmapGpaRange(whpx->partition, start_pa,
+                                           aligned_size);
+        if (FAILED(hr)) {
+            error_report("WHPX: failed to unmap 3dfx GPA range");
+        }
+        return;
+    }
+
+    hr = whp_dispatch.WHvMapGpaRange(whpx->partition, host_va, start_pa,
+                                     aligned_size,
+                                     WHvMapGpaRangeFlagRead |
+                                     WHvMapGpaRangeFlagExecute |
+                                     (readonly ? 0 : WHvMapGpaRangeFlagWrite));
+    if (FAILED(hr)) {
+        error_report("WHPX: failed to map 3dfx GPA range");
+    }
+}
+#endif /* CONFIG_QEMU_3DFX */
+
 static void whpx_region_add(MemoryListener *listener,
                            MemoryRegionSection *section)
 {
