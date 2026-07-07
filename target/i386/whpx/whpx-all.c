@@ -462,6 +462,9 @@ static void whpx_set_legacy_fp_registers(CPUState *cpu, WHPXStateLevel level)
 
     assert(cpu_is_stopped(cpu) || qemu_cpu_is_self(cpu));
 
+    /* FIX vs upstream: vcxt was uninitialized stack memory */
+    memset(&vcxt, 0, sizeof(vcxt));
+
     /* 16 XMM registers */
     assert(whpx_register_names_legacy_fp[idx] == WHvX64RegisterXmm0);
     idx_next = idx + 16;
@@ -471,13 +474,19 @@ static void whpx_set_legacy_fp_registers(CPUState *cpu, WHPXStateLevel level)
     }
     idx = idx_next;
 
-    /* 8 FP registers */
+    /*
+     * 8 FP registers.
+     * FIX vs upstream: an 80-bit x87 register is mantissa (Low64) plus
+     * sign/exponent (low 16 bits of High64).  Upstream only transfers the
+     * mantissa (the High64 store didn't compile against the 64-bit MMXReg
+     * view and was commented out), so every ST register's exponent was
+     * written to the hypervisor as garbage on every non-xsave (pre-XSAVE
+     * guest OS, e.g. Win9x) state sync, destroying guest x87 state.
+     */
     assert(whpx_register_names_legacy_fp[idx] == WHvX64RegisterFpMmx0);
     for (i = 0; i < 8; i += 1, idx += 1) {
-        vcxt.values[idx].Fp.AsUINT128.Low64 = env->fpregs[i].mmx.MMX_Q(0);
-        /* vcxt.values[idx].Fp.AsUINT128.High64 =
-               env->fpregs[i].mmx.MMX_Q(1);
-        */
+        vcxt.values[idx].Fp.AsUINT128.Low64 = env->fpregs[i].d.low;
+        vcxt.values[idx].Fp.AsUINT128.High64 = env->fpregs[i].d.high;
     }
 
     /* FP control status register */
@@ -783,13 +792,13 @@ static void whpx_get_legacy_fp_registers(CPUState *cpu, WHPXStateLevel level)
     }
     idx = idx_next;
 
-    /* 8 FP registers */
+    /* 8 FP registers.  FIX vs upstream: transfer the x87 sign/exponent
+     * half too, not just the mantissa — see whpx_set_legacy_fp_registers. */
     assert(whpx_register_names_legacy_fp[idx] == WHvX64RegisterFpMmx0);
     for (i = 0; i < 8; i += 1, idx += 1) {
-        env->fpregs[i].mmx.MMX_Q(0) = vcxt.values[idx].Fp.AsUINT128.Low64;
-        /* env->fpregs[i].mmx.MMX_Q(1) =
-               vcxt.values[idx].Fp.AsUINT128.High64;
-        */
+        env->fpregs[i].d.low = vcxt.values[idx].Fp.AsUINT128.Low64;
+        env->fpregs[i].d.high =
+            (uint16_t)vcxt.values[idx].Fp.AsUINT128.High64;
     }
 
     /* FP control status register */
