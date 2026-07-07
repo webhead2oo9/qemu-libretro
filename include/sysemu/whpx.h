@@ -1,34 +1,17 @@
 /*
  * QEMU Windows Hypervisor Platform accelerator (WHPX) support
  *
- * Copyright Microsoft, Corp. 2017
- *
- * Authors:
- *
- * This work is licensed under the terms of the GNU GPL, version 2 or later.
- * See the COPYING file in the top-level directory.
- *
+ * Compat forwarder: the real header lives at system/whpx.h (upstream
+ * moved include/sysemu -> include/system in QEMU 10). Kept so 9.0-era
+ * callers that include "sysemu/whpx.h" keep building.
  */
 
-/* header to be included in non-WHPX-specific code */
+#ifndef QEMU_SYSEMU_WHPX_COMPAT_H
+#define QEMU_SYSEMU_WHPX_COMPAT_H
 
-#ifndef QEMU_WHPX_H
-#define QEMU_WHPX_H
+#include "system/whpx.h"
 
-#ifdef COMPILING_PER_TARGET
+/* 9.0-era API name; upstream renamed the concept to irqchip-in-kernel */
+#define whpx_apic_in_platform() (whpx_irqchip_in_kernel())
 
-#ifdef CONFIG_WHPX
-
-int whpx_enabled(void);
-bool whpx_apic_in_platform(void);
-
-#else /* CONFIG_WHPX */
-
-#define whpx_enabled() (0)
-#define whpx_apic_in_platform() (0)
-
-#endif /* CONFIG_WHPX */
-
-#endif /* COMPILING_PER_TARGET */
-
-#endif /* QEMU_WHPX_H */
+#endif /* QEMU_SYSEMU_WHPX_COMPAT_H */

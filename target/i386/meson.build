@@ -11,6 +11,7 @@ i386_ss.add(when: 'CONFIG_SEV', if_true: files('host-cpu.c', 'confidential-guest
 # x86 cpu type
 i386_ss.add(when: 'CONFIG_KVM', if_true: files('host-cpu.c'))
 i386_ss.add(when: 'CONFIG_HVF', if_true: files('host-cpu.c'))
+i386_ss.add(when: 'CONFIG_WHPX', if_true: files('host-cpu.c'))
 
 i386_system_ss = ss.source_set()
 i386_system_ss.add(files(
@@ -27,6 +28,7 @@ i386_user_ss = ss.source_set()
 
 subdir('kvm')
 subdir('whpx')
+subdir('emulate')
 subdir('nvmm')
 subdir('hvf')
 subdir('tcg')
