@@ -901,12 +901,505 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_MEMORY_ACCESS_CONTEXT *ctx)
     return 0;
 }
 
+/*
+ * Translate (and access-validate) one guest page for the string port I/O
+ * emulator, with a one-entry cache so the common sequential case does not
+ * pay a hypercall per element. 'gva_page' must be 4K-aligned.
+ */
+static bool whpx_string_portio_xlat(CPUState *cpu, uint64_t gva_page,
+                                    bool write_mem, uint64_t *cache_gva,
+                                    uint64_t *cache_gpa)
+{
+    struct whpx_state *whpx = &whpx_global;
+    WHV_TRANSLATE_GVA_RESULT res;
+    WHV_GUEST_PHYSICAL_ADDRESS gpa;
+    HRESULT hr;
+
+    if (*cache_gva == gva_page) {
+        return true;
+    }
+
+    /*
+     * SetPageTableBits marks the PTE accessed (and dirty, for writes)
+     * exactly as executing the instruction would. Without it, pages
+     * filled by INS still look clean and cold to the guest's pager,
+     * which may then evict them preferentially and discard rather than
+     * write back their contents — freshly transferred data silently
+     * evaporating under memory pressure.
+     */
+    hr = whp_dispatch.WHvTranslateGva(whpx->partition, cpu->cpu_index,
+                                      gva_page,
+                                      (write_mem
+                                          ? WHvTranslateGvaFlagValidateWrite
+                                          : WHvTranslateGvaFlagValidateRead) |
+                                      WHvTranslateGvaFlagSetPageTableBits,
+                                      &res, &gpa);
+    if (FAILED(hr) || res.ResultCode != WHvTranslateGvaResultSuccess) {
+        return false;
+    }
+
+    *cache_gva = gva_page;
+    *cache_gpa = gpa & ~0xfffull;
+    return true;
+}
+
+/*
+ * Copy one element between guest-virtual memory and 'buf'. Every 4K page
+ * is translated separately so an element that straddles a page boundary
+ * reaches the correct physical pages: guest-virtually contiguous is not
+ * guest-physically contiguous under paging (e.g. Win9x V86 mappings).
+ */
+static bool whpx_string_portio_mem(CPUState *cpu, uint64_t gva, void *buf,
+                                   unsigned len, bool write_mem,
+                                   uint64_t *cache_gva, uint64_t *cache_gpa)
+{
+    uint8_t *p = buf;
+
+    while (len) {
+        unsigned off = gva & 0xfff;
+        unsigned chunk = MIN(len, 0x1000 - off);
+
+        if (!whpx_string_portio_xlat(cpu, gva & ~0xfffull, write_mem,
+                                     cache_gva, cache_gpa)) {
+            return false;
+        }
+        cpu_physical_memory_rw(*cache_gpa | off, p, chunk, write_mem);
+        p += chunk;
+        gva += chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+/*
+ * Decode an INS/OUTS instruction's prefix bytes. Returns the opcode
+ * byte's index within 'bytes', or -1 when no INS/OUTS opcode is
+ * positively identified within 'len' bytes (truncated capture or an
+ * unrecognized byte). '*asize' and '*oseg' are set from any address-size
+ * / segment-override prefixes encountered before the opcode.
+ */
+static int whpx_decode_string_portio(const uint8_t *bytes, unsigned len,
+                                     bool cs_long, unsigned dsize,
+                                     unsigned *asize, int *oseg)
+{
+    *asize = dsize;
+    *oseg = -1;
+
+    for (unsigned i = 0; i < len; i++) {
+        uint8_t b = bytes[i];
+
+        if ((b & 0xFC) == 0x6C) {      /* 6C-6F: INSB/INSW/OUTSB/OUTSW */
+            return i;
+        }
+        switch (b) {
+        case 0x67:                     /* address-size override */
+            *asize = dsize == 4 ? 2 : 4;
+            break;
+        case 0x26:
+            *oseg = R_ES;
+            break;
+        case 0x2E:
+            *oseg = R_CS;
+            break;
+        case 0x36:
+            *oseg = R_SS;
+            break;
+        case 0x3E:
+            *oseg = R_DS;
+            break;
+        case 0x64:
+            *oseg = R_FS;
+            break;
+        case 0x65:
+            *oseg = R_GS;
+            break;
+        case 0x66:                     /* operand size: no effect here */
+        case 0xF2:                     /* REPNE: behaves as REP for INS/OUTS */
+        case 0xF3:                     /* REP */
+            break;
+        default:
+            if (cs_long && (b & 0xF0) == 0x40) {
+                break;                 /* REX: no effect on INS/OUTS */
+            }
+            return -1;                 /* unrecognized byte */
+        }
+    }
+    return -1;                         /* opcode not within 'len' bytes */
+}
+
+/*
+ * WinHvEmulation's instruction decoder rejects the legacy string port I/O
+ * forms (notably 16-bit REP INSW/OUTSW issued from real/V86 mode) that
+ * DOS-era guests — Windows 9x's compatibility disk path in particular —
+ * use for IDE/ATAPI transfers, and a rejected StringOp exit is otherwise
+ * fatal. Decode and emulate string port I/O here instead. The semantics
+ * mirror target/i386/mshv's handling of the same underlying hypervisor
+ * message: OUTS reads DS:rSI (segment override honored), INS stores to
+ * ES:rDI (overrides architecturally ignored), rCX repeats when a REP
+ * prefix is present, RFLAGS.DF picks the direction, index/count registers
+ * are masked to the effective address size, and RIP advances by the full
+ * instruction length only once the transfer is complete.
+ *
+ * Returns 0 when the exit was fully handled and the registers were
+ * written back. Returns -1 without any side effect when the instruction
+ * cannot be positively decoded (caller falls back to the platform
+ * emulator), or — after committing partial progress to the registers so
+ * nothing can be lost or double-executed — when a guest page fails to
+ * translate mid-transfer (fail closed).
+ */
+static int whpx_emulate_string_portio(CPUState *cpu,
+                                      const WHV_VP_EXIT_CONTEXT *vp,
+                                      const WHV_X64_IO_PORT_ACCESS_CONTEXT *ctx)
+{
+    struct whpx_state *whpx = &whpx_global;
+    static unsigned diag_left = 16;
+    static unsigned diag_declines;
+    static uint64_t diag_ops;
+    unsigned size = ctx->AccessInfo.AccessSize;   /* element size in bytes */
+    bool is_out = ctx->AccessInfo.IsWrite;        /* true: OUTS, port write */
+    bool rep = ctx->AccessInfo.RepPrefix;
+    bool df = vp->Rflags & (1ULL << 10);          /* RFLAGS.DF */
+    HRESULT hr;
+
+    if (size != 1 && size != 2 && size != 4) {
+        return -1;
+    }
+
+    /*
+     * Decode the captured instruction bytes. INS/OUTS have no ModRM,
+     * displacement or immediate, so the instruction is exactly its
+     * prefixes plus one opcode byte and the decode is complete. The
+     * default address size comes from the CS attributes; a 0x67 prefix
+     * selects the non-default size. The effective instruction length is
+     * derived from the decoded bytes rather than vp->InstructionLength so
+     * that a wrong/zero hypervisor length can never strand RIP inside the
+     * instruction (a stray re-executed opcode byte transfers extra
+     * elements and shears the device's sector stream).
+     */
+    unsigned dsize = vp->Cs.Long ? 8 : vp->Cs.Default ? 4 : 2;
+    uint64_t ipmask = vp->Cs.Long ? ~0ull
+                    : vp->Cs.Default ? 0xffffffffull : 0xffffull;
+    unsigned asize;
+    int oseg;                          /* segment override (R_ES..R_GS) */
+    int opcode_idx = whpx_decode_string_portio(ctx->InstructionBytes,
+                                               ctx->InstructionByteCount,
+                                               vp->Cs.Long, dsize,
+                                               &asize, &oseg);
+
+    /*
+     * The hypervisor's instruction-byte capture is best-effort: exits can
+     * arrive with no (or truncated) bytes. Such a transfer must not fall
+     * back to WinHvEmulation — that is exactly the emulator that
+     * mishandles these forms — so fetch the bytes from CS:RIP ourselves
+     * and decode again. A fetch that straddles into an unmapped page is
+     * retried with only the mapped part; INS/OUTS with prefixes fits in
+     * far fewer bytes than a page in any case.
+     */
+    uint8_t insn_buf[15];
+    if (opcode_idx < 0) {
+        uint64_t fetch_gva = vp->Cs.Base + (vp->Rip & ipmask);
+        uint64_t cg = ~0ull, cp = 0;
+        unsigned flen = sizeof(insn_buf);
+
+        if (!whpx_string_portio_mem(cpu, fetch_gva, insn_buf, flen, false,
+                                    &cg, &cp)) {
+            flen = MIN(flen, 0x1000 - (unsigned)(fetch_gva & 0xfff));
+            cg = ~0ull;
+            if (!whpx_string_portio_mem(cpu, fetch_gva, insn_buf, flen,
+                                        false, &cg, &cp)) {
+                flen = 0;
+            }
+        }
+        opcode_idx = whpx_decode_string_portio(insn_buf, flen, vp->Cs.Long,
+                                               dsize, &asize, &oseg);
+        if (opcode_idx < 0) {
+            if (diag_declines < 32) {
+                diag_declines++;
+                warn_report("WHPX: string port I/O DECLINED (#%u ->"
+                            " WinHvEmulation): port=0x%04x size=%u rep=%u"
+                            " hv_bytes=%u fetched=%u rip=0x%" PRIx64
+                            " cs.base=0x%" PRIx64 " v86=%u",
+                            diag_declines, ctx->PortNumber, size,
+                            (unsigned)rep,
+                            (unsigned)ctx->InstructionByteCount, flen,
+                            (uint64_t)vp->Rip, (uint64_t)vp->Cs.Base,
+                            !!(vp->Rflags & (1ULL << 17)));
+            }
+            return -1;
+        }
+    }
+    unsigned ilen = opcode_idx + 1;
+
+    /*
+     * Resolve the memory operand's segment base. INS always uses ES:rDI.
+     * OUTS uses DS:rSI by default; the exit context only carries DS and
+     * ES, so fetch any other overriding segment's base on demand (still
+     * before any side effect).
+     */
+    const WHV_X64_SEGMENT_REGISTER *seg = is_out ? &ctx->Ds : &ctx->Es;
+    WHV_X64_SEGMENT_REGISTER oseg_val;
+    if (is_out && oseg >= 0 && oseg != R_DS) {
+        if (oseg == R_ES) {
+            seg = &ctx->Es;
+        } else {
+            static const WHV_REGISTER_NAME seg_names[] = {
+                [R_CS] = WHvX64RegisterCs,
+                [R_SS] = WHvX64RegisterSs,
+                [R_FS] = WHvX64RegisterFs,
+                [R_GS] = WHvX64RegisterGs,
+            };
+            WHV_REGISTER_VALUE seg_val;
+
+            hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+                whpx->partition, cpu->cpu_index, &seg_names[oseg], 1,
+                &seg_val);
+            if (FAILED(hr)) {
+                return -1;
+            }
+            oseg_val = seg_val.Segment;
+            seg = &oseg_val;
+        }
+    }
+
+    warn_report_once("WHPX: emulating legacy string port I/O in QEMU"
+                     " (port 0x%x, %u byte(s)/element)",
+                     ctx->PortNumber, size);
+
+    uint64_t amask = asize == 2 ? 0xffffull
+                   : asize == 4 ? 0xffffffffull : ~0ull;
+    uint64_t rcx = ctx->Rcx;
+    uint64_t rsi = ctx->Rsi;
+    uint64_t rdi = ctx->Rdi;
+    uint64_t count = rep ? rcx & amask : 1;
+
+    /*
+     * Cap the elements handled per exit. 65536 covers any 16-bit rCX in
+     * a single pass, so legacy IDE/ATAPI transfers never resume mid-REP;
+     * absurd 32/64-bit counts are chunked by leaving RIP on the
+     * instruction with the counters updated — REP is architecturally
+     * interruptible and the next exit continues exactly where this one
+     * stopped (and is again handled here, first, on re-entry).
+     */
+    uint64_t batch = MIN(count, 65536);
+    uint64_t cache_gva = ~0ull, cache_gpa = 0;
+    int result = 0;
+    uint64_t done_elems = 0;
+
+    for (uint64_t n = 0; n < batch; n++) {
+        uint64_t idx = (is_out ? rsi : rdi) & amask;
+        uint64_t gva = seg->Base + idx;
+        uint32_t val = 0;
+        MemTxAttrs attrs = { 0 };
+
+        if (is_out) {
+            /*
+             * Memory is read before the port is written: a translation
+             * failure aborts this element with no side effect.
+             */
+            if (!whpx_string_portio_mem(cpu, gva, &val, size, false,
+                                        &cache_gva, &cache_gpa)) {
+                result = -1;
+                break;
+            }
+            address_space_rw(&address_space_io, ctx->PortNumber, attrs,
+                             &val, size, true);
+        } else {
+            /*
+             * Validate the destination page(s) before reading the port:
+             * device data is consumed by the read, so failing afterwards
+             * would lose an element and desync the device's transfer
+             * state machine.
+             */
+            if (!whpx_string_portio_xlat(cpu, gva & ~0xfffull, true,
+                                         &cache_gva, &cache_gpa) ||
+                ((((gva + size - 1) ^ gva) & ~0xfffull) != 0 &&
+                 !whpx_string_portio_xlat(cpu, (gva + size - 1) & ~0xfffull,
+                                          true, &cache_gva, &cache_gpa))) {
+                result = -1;
+                break;
+            }
+            address_space_rw(&address_space_io, ctx->PortNumber, attrs,
+                             &val, size, false);
+            if (!whpx_string_portio_mem(cpu, gva, &val, size, true,
+                                        &cache_gva, &cache_gpa)) {
+                /* Unreachable: both pages were validated above. */
+                result = -1;
+                break;
+            }
+        }
+
+        uint64_t step = df ? -(uint64_t)size : size;
+        if (is_out) {
+            rsi = (rsi & ~amask) | ((rsi + step) & amask);
+        } else {
+            rdi = (rdi & ~amask) | ((rdi + step) & amask);
+        }
+        if (rep) {
+            rcx = (rcx & ~amask) | ((rcx - 1) & amask);
+        }
+        done_elems++;
+    }
+
+    /*
+     * Write the updated register state back, RIP included only when the
+     * whole transfer is done (IP wraps at the code-size width, e.g.
+     * 16-bit real mode). On a mid-transfer failure the registers reflect
+     * the elements actually transferred and RIP stays on the
+     * instruction, so no element is ever skipped or double-executed.
+     */
+    bool done = result == 0 && (!rep || (rcx & amask) == 0);
+    WHV_REGISTER_NAME names[4] = { WHvX64RegisterRip, WHvX64RegisterRcx,
+                                   WHvX64RegisterRsi, WHvX64RegisterRdi };
+    WHV_REGISTER_VALUE vals[4] = { 0 };
+    vals[0].Reg64 = (vp->Rip & ~ipmask) |
+                    ((vp->Rip + (done ? ilen : 0)) & ipmask);
+    vals[1].Reg64 = rcx;
+    vals[2].Reg64 = rsi;
+    vals[3].Reg64 = rdi;
+
+    /*
+     * Dump the decoded operation for the first few occurrences — and a
+     * periodic sample thereafter — so the emulation can be checked
+     * against real guest traffic across every workload phase.
+     */
+    diag_ops++;
+    if (diag_left || (diag_ops & 0x3fff) == 0) {
+        if (diag_left) {
+            diag_left--;
+        }
+        warn_report("WHPX: string port I/O: %s port=0x%04x elem=%uB rep=%u"
+                    " df=%u asize=%u count=%" PRIu64 " xfrd=%" PRIu64
+                    " seg.base=0x%" PRIx64 " rsi=0x%" PRIx64
+                    " rdi=0x%" PRIx64 " rip=0x%" PRIx64 " ilen=%u(hv:%u)"
+                    " -> rcx=0x%" PRIx64 " rip=0x%" PRIx64 "%s%s",
+                    is_out ? "OUTS" : "INS", ctx->PortNumber, size,
+                    (unsigned)rep, (unsigned)df, asize, count, done_elems,
+                    (uint64_t)seg->Base, (uint64_t)ctx->Rsi,
+                    (uint64_t)ctx->Rdi, (uint64_t)vp->Rip, ilen,
+                    (unsigned)vp->InstructionLength, rcx, vals[0].Reg64,
+                    done ? "" : " (resume)",
+                    result ? " (translate failed: failing closed)" : "");
+    }
+
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx->partition, cpu->cpu_index, names, 4, vals);
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to set registers after string port I/O,"
+                     " hr=%08lx", hr);
+        return -1;
+    }
+    /* Register state was written directly; avoid a stale double write on
+     * resume (same as whpx_emu_setreg_callback). */
+    cpu->accel->dirty = false;
+
+    return result;
+}
+
 static int whpx_handle_portio(CPUState *cpu,
                               WHV_X64_IO_PORT_ACCESS_CONTEXT *ctx)
 {
     HRESULT hr;
     AccelCPUState *vcpu = cpu->accel;
     WHV_EMULATOR_STATUS emu_status;
+
+    /*
+     * Handle string port I/O directly whenever it decodes cleanly, and
+     * only fall back to WinHvEmulation for exits that are declined.
+     * WinHvEmulation rejects the legacy string forms DOS-era guests use
+     * for disk transfers (a rejected StringOp exit is otherwise fatal),
+     * and routing every REP chunk through a closed-source emulator that
+     * shares our I/O callbacks would make correctness depend on it being
+     * side-effect free on the paths where it fails.
+     */
+    if (ctx->AccessInfo.StringOp) {
+        static unsigned fallthrough_log = 32;
+
+        if (whpx_emulate_string_portio(cpu, &vcpu->exit_ctx.VpContext,
+                                       ctx) == 0) {
+            return 0;
+        }
+        if (fallthrough_log) {
+            fallthrough_log--;
+            warn_report("WHPX: StringOp fell through to WinHvEmulation:"
+                        " port=0x%04x size=%u write=%u rep=%u"
+                        " rcx=0x%" PRIx64,
+                        ctx->PortNumber, ctx->AccessInfo.AccessSize,
+                        (unsigned)ctx->AccessInfo.IsWrite,
+                        (unsigned)ctx->AccessInfo.RepPrefix,
+                        (uint64_t)ctx->Rcx);
+        }
+    } else {
+        /*
+         * Handle simple IN/OUT inline too, as current upstream QEMU does,
+         * keeping WinHvEmulation out of the port I/O path entirely. The
+         * exit context carries everything needed: port, direction, width
+         * and rAX. Device state machines (IDE command/status protocol in
+         * particular) are sensitive to a mis-emulated access — a wrong
+         * width or a double-executed instruction desyncs the device even
+         * though every data transfer is individually correct.
+         */
+        X86CPU *x86_cpu = X86_CPU(cpu);
+        CPUX86State *env = &x86_cpu->env;
+        const WHV_VP_EXIT_CONTEXT *vp = &vcpu->exit_ctx.VpContext;
+        unsigned size = ctx->AccessInfo.AccessSize;
+
+        if (size == 1 || size == 2 || size == 4) {
+            MemTxAttrs attrs = { 0 };
+            uint64_t rip_next = vp->Rip + vp->InstructionLength;
+            uint64_t val = 0;
+
+            warn_report_once("WHPX: handling non-string port I/O inline,"
+                             " without WinHvEmulation (port 0x%x)",
+                             ctx->PortNumber);
+
+            if (ctx->AccessInfo.IsWrite) {
+                val = ctx->Rax & (size == 4 ? 0xffffffffull
+                                : size == 2 ? 0xffffull : 0xffull);
+                address_space_rw(&address_space_io, ctx->PortNumber, attrs,
+                                 &val, size, true);
+                /*
+                 * A port access can pull QEMU-side CPU state in (vmport
+                 * reads call cpu_synchronize_state): once dirty, the
+                 * registers must be updated there instead, or the later
+                 * full write-back would clobber these with stale values.
+                 */
+                if (!cpu->accel->dirty) {
+                    WHV_REGISTER_NAME name = WHvX64RegisterRip;
+                    WHV_REGISTER_VALUE rv = { 0 };
+
+                    rv.Reg64 = rip_next;
+                    whp_dispatch.WHvSetVirtualProcessorRegisters(
+                        whpx_global.partition, cpu->cpu_index, &name, 1,
+                        &rv);
+                } else {
+                    env->eip = rip_next;
+                }
+            } else {
+                uint64_t rax;
+
+                address_space_rw(&address_space_io, ctx->PortNumber, attrs,
+                                 &val, size, false);
+                rax = size == 4 ? (uint32_t)val
+                    : size == 2 ? ((ctx->Rax & ~0xffffull) | (uint16_t)val)
+                    : ((ctx->Rax & ~0xffull) | (uint8_t)val);
+                if (!cpu->accel->dirty) {
+                    WHV_REGISTER_NAME names[2] = { WHvX64RegisterRip,
+                                                   WHvX64RegisterRax };
+                    WHV_REGISTER_VALUE rvs[2] = { 0 };
+
+                    rvs[0].Reg64 = rip_next;
+                    rvs[1].Reg64 = rax;
+                    whp_dispatch.WHvSetVirtualProcessorRegisters(
+                        whpx_global.partition, cpu->cpu_index, names, 2,
+                        rvs);
+                } else {
+                    env->eip = rip_next;
+                    env->regs[R_EAX] = rax;
+                }
+            }
+            return 0;
+        }
+    }
 
     hr = whp_dispatch.WHvEmulatorTryIoEmulation(
         vcpu->emulator, cpu,
