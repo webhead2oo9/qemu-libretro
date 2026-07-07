@@ -29,6 +29,7 @@
 #include "trace.h"
 #include "hw/boards.h"
 #include "sysemu/kvm.h"
+#include "sysemu/whpx.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
@@ -284,8 +285,16 @@ static void apic_common_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    /* Note: We need at least 1M to map the VAPIC option ROM */
-    if (!vapic && s->vapic_control & VAPIC_ENABLE_MASK &&
+    /*
+     * Note: We need at least 1M to map the VAPIC option ROM.
+     *
+     * Skip the vapic under WHPX: its TPR-patching machinery predates the
+     * WHPX backport and wedges XP-era guests at their first TPR access
+     * (kernel-irqchip=off) or degrades them to a crawl (kernel-irqchip=on).
+     * WHPX gains nothing from it anyway - with the in-kernel APIC, TPR
+     * accesses never leave the hypervisor.
+     */
+    if (!vapic && !whpx_enabled() && s->vapic_control & VAPIC_ENABLE_MASK &&
             current_machine->ram_size >= 1024 * 1024) {
         vapic = sysbus_create_simple("kvmvapic", -1, NULL);
     }
