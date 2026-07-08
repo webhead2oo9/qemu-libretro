@@ -113,7 +113,12 @@ static int linearize(CPUState *cpu,
         limit = x86_segment_limit(&desc);
 
         if (segment_expands_down(desc)) {
-            if (logical_addr_32b >= limit) {
+            /*
+             * Expand-down segments (Win9x DPMI stacks) permit offsets in
+             * (limit, 0xFFFF/0xFFFFFFFF]; offsets at or below the limit
+             * fault.  SDM Vol 3A 5.3.1.
+             */
+            if (logical_addr_32b <= limit) {
                 error_report("Address exceeds limit (expands down)");
                 return -1;
             }
