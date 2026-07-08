@@ -521,8 +521,15 @@ static size_t audio_put_buffer_out(HWVoiceOut *hw, void *buf, size_t size)
 	return ret;
 }
 
+// The console reports damaged regions here after graphic_hw_update
+// re-renders them; refresh() uses it to skip publishing unchanged
+// frames (WHPX cannot track dirty VRAM, so the VGA code re-renders
+// every tick — but an idle desktop still produces no damage reports).
+static bool surface_damaged;
+
 static void gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h)
 {
+	surface_damaged = true;
 }
 
 static void gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
@@ -546,6 +553,7 @@ static void gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
 		pthread_mutex_unlock(&av_info_lock);
 	}
 	surface = new_surface;
+	surface_damaged = true;
 }
 
 static bool gfx_check_format(DisplayChangeListener *dcl,
@@ -556,11 +564,21 @@ static bool gfx_check_format(DisplayChangeListener *dcl,
 
 static void refresh(DisplayChangeListener *dcl)
 {
-	CALL_QEMU_FUNC(graphic_hw_update, dcl->con);
+	// Re-render the guest display at ~30 Hz but keep input injection at
+	// the full tick rate: with WHPX the VGA code re-converts the whole
+	// surface on every update (no dirty VRAM tracking), and doing that
+	// at 60 Hz under the BQL starves port-I/O-heavy guests like Win9x.
+	static unsigned tick;
+	if ((tick++ & 1) == 0) {
+		CALL_QEMU_FUNC(graphic_hw_update, dcl->con);
+	}
 
 	// Publish the frame: copy it out so the frontend can present it
 	// while QEMU keeps running. This runs on the emu thread under the
 	// BQL, so the copy must be the only thing the frontend can wait on.
+	// Always publish: the frontend re-inits its video driver to black on
+	// geometry changes and only recovers on a real (non-dupe) frame, and
+	// its frame pacing relies on real frames arriving.
 	if (surface && !fx_active) {
 		int w = surface_width(surface);
 		int h = surface_height(surface);
@@ -645,6 +663,11 @@ static void fx_sink_publish(const void *pixels, int w, int h)
 static void fx_sink_set_active(bool on)
 {
 	fx_active = on;
+	// returning to 2D: force one publish even if the console reports
+	// no fresh damage
+	if (!on) {
+		surface_damaged = true;
+	}
 
 	// Back to 2D: snap the geometry to the VGA surface so the next
 	// published frame is not presented at the 3D resolution.
