@@ -11,6 +11,14 @@ focuses on older RetroArch frontends:
   `SET_MESSAGE_EXT`, which needs RetroArch 1.9+, to the original API).
 - **Hardware virtualization on Windows (WHPX)** is compiled into the win64
   build: near-native guest CPU speed instead of software emulation.
+- **3D acceleration** on the win64 build via
+  [qemu-3dfx](https://github.com/kjliew/qemu-3dfx) pass-through — Glide
+  and OpenGL games render on the host GPU (see *3D acceleration* below).
+- **User-mode networking**: `-netdev user` (slirp) is built in.
+- Performance work throughout: frame presentation, audio, and input no
+  longer block the emulator on the frontend (fixes audio crackle), WHPX
+  guests get hardware dirty-page tracking (idle desktops stop burning
+  CPU on redraws) and far fewer hypercalls on emulated string I/O.
 - Builds with `-O2` (faster emulation) and fixes building with plain
   mingw-w64.
 
@@ -52,6 +60,30 @@ This uses the Windows Hypervisor Platform (enable it under *Windows
 Features* if it isn't already) and falls back to software emulation (`tcg`)
 when unavailable. x86 guests only.
 
+On Windows 10 1903 or newer the core also uses hardware dirty-page
+tracking, so an idle guest desktop costs almost no CPU. Older Windows
+versions still work; they just re-render the display every tick.
+
+### Networking
+
+User-mode NAT networking is built in:
+
+``` sh
+qemu-system-x86_64 ... -netdev user,id=net0 -device rtl8139,netdev=net0
+```
+
+Use `pcnet` for Windows 9x guests (in-box driver), `rtl8139` for
+2000/XP, or `e1000` for newer systems.
+
+### Audio buffer
+
+If audio crackles, enlarge the core's audio ring with `out.buffer-length`
+(microseconds; the default is ~23 ms):
+
+``` sh
+-audiodev libretro,id=snd0,out.buffer-length=46440
+```
+
 ### Choosing a video card
 
 The core outputs a 32-bit software framebuffer. Recommendations:
@@ -64,6 +96,25 @@ The core outputs a 32-bit software framebuffer. Recommendations:
   this core: those devices hand their framebuffer to the frontend without
   conversion and will render wrong colors at anything but 32-bit. `std` and
   `cirrus` are safe at every depth.
+
+## 3D acceleration (qemu-3dfx pass-through)
+
+The win64 core includes the Glide and OpenGL pass-through devices from
+[qemu-3dfx](https://github.com/kjliew/qemu-3dfx). Games inside the guest
+render on the host GPU; finished frames are read back and presented
+through the frontend like any other core output — no extra window
+appears. To use it, install the qemu-3dfx guest wrappers inside the VM
+(the Glide DLLs / OpenGL ICD from that project). Direct3D games can work
+through a D3D-to-OpenGL wrapper (e.g. WineD3D) on top of it.
+
+Notes:
+
+- **Frame pacing:** the core deliberately disables host vsync on the
+  offscreen swap chain, so old games that relied on vsync as their speed
+  limit will run uncapped. Cap them per game with qemu-3dfx's `FpsLimit`
+  config: put `glide.cfg` (Glide) or `mesagl.cfg` (OpenGL) containing a
+  line like `FpsLimit,60` next to your content / `.qemu_cmd_line` file.
+- The asynchronous readback adds one frame of display latency.
 
 ## Examples
 
