@@ -1526,6 +1526,17 @@ static void sidecar_m3u_parse(const char *content_path)
 				    content_path);
 	if (g_file_test(m3u, G_FILE_TEST_IS_REGULAR)) {
 		m3u_parse(m3u, disc_list);
+		// The same playlist may double as the content form, whose
+		// first line names the boot config. A machine description
+		// is never an insertable disc, so drop such entries — this
+		// makes opening the .qemu_cmd_line and opening the .m3u
+		// converge on the same disc set.
+		for (unsigned i = disc_list->len; i-- > 0;) {
+			if (g_str_has_suffix(disc_list->pdata[i],
+					     ".qemu_cmd_line")) {
+				g_ptr_array_remove_index(disc_list, i);
+			}
+		}
 	}
 	g_free(m3u);
 }
@@ -1914,6 +1925,12 @@ bool retro_load_game(const struct retro_game_info *game)
 			first_disc = 1;
 		}
 		for (unsigned i = first_disc; i < entries->len; i++) {
+			// Configs are never discs; only the first line may
+			// name one (handled above).
+			if (g_str_has_suffix(entries->pdata[i],
+					     ".qemu_cmd_line")) {
+				continue;
+			}
 			g_ptr_array_add(disc_list,
 					g_strdup(entries->pdata[i]));
 		}
