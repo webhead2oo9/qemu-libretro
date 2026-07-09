@@ -604,9 +604,10 @@ static size_t audio_put_buffer_out(HWVoiceOut *hw, void *buf, size_t size)
 }
 
 // The console reports damaged regions here after graphic_hw_update
-// re-renders them; refresh() uses it to skip publishing unchanged
-// frames (WHPX cannot track dirty VRAM, so the VGA code re-renders
-// every tick — but an idle desktop still produces no damage reports).
+// re-renders them; refresh() skips publishing when nothing changed.
+// Meaningful only with working dirty-VRAM tracking (WHPX with
+// dirty-page tracking, or TCG) — without it every update reports full
+// damage and this degrades to publish-every-tick.
 static bool surface_damaged;
 
 static void gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h)
@@ -646,23 +647,21 @@ static bool gfx_check_format(DisplayChangeListener *dcl,
 
 static void refresh(DisplayChangeListener *dcl)
 {
-	// Re-render the guest display at ~30 Hz: with WHPX the VGA code
-	// re-converts the whole surface on every update (no dirty VRAM
-	// tracking), and doing that at 60 Hz under the BQL starves
-	// port-I/O-heavy guests like Win9x.
-	static unsigned tick;
-	bool rendered = (tick++ & 1) == 0;
-	if (rendered) {
-		CALL_QEMU_FUNC(graphic_hw_update, dcl->con);
-	}
+	// Re-render at the full tick rate: with WHPX dirty-page tracking
+	// (or TCG) the VGA code only re-converts lines whose VRAM actually
+	// changed, so a quiet display costs almost nothing here. Hosts
+	// without tracking (pre-1903 Windows) pay a full re-convert per
+	// tick, as they did before the tracking existed.
+	CALL_QEMU_FUNC(graphic_hw_update, dcl->con);
 
 	// Publish the frame: copy it out so the frontend can present it
-	// while QEMU keeps running. Only ticks that re-rendered can have
-	// changed the surface, so the others skip the copy; retro_run dupes
-	// the previous frame in between. Publish on every rendered tick
-	// though: the frontend re-inits its video driver to black on
-	// geometry changes and only recovers on a real (non-dupe) frame.
-	if (rendered && surface && !fx_active) {
+	// while QEMU keeps running — but only when the console reported
+	// damage; retro_run dupes the previous frame on quiet ticks.
+	// gfx_switch and the fx handoff force the flag, so geometry
+	// changes always publish a real frame (the frontend re-inits its
+	// video driver to black on those and needs one to recover).
+	if (surface && !fx_active && surface_damaged) {
+		surface_damaged = false;
 		int w = surface_width(surface);
 		int h = surface_height(surface);
 		int stride = surface_stride(surface);

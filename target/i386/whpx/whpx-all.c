@@ -3259,6 +3259,18 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
         goto error;
     }
 
+    /*
+     * Hardware dirty-page tracking needs both the capability bit and the
+     * WHvQueryGpaRangeDirtyBitmap export (Win10 1903+). Without it, the
+     * memory listener keeps its mark-everything-dirty fallback.
+     */
+    whpx->dirty_page_tracking = features.DirtyPageTracking &&
+        whp_dispatch.WHvQueryGpaRangeDirtyBitmap != NULL;
+    if (!whpx->dirty_page_tracking) {
+        warn_report("WHPX: no dirty-page tracking; "
+                    "display updates will re-render fully");
+    }
+
     hr = whp_dispatch.WHvCreatePartition(&whpx->partition);
     if (FAILED(hr)) {
         error_report("WHPX: Failed to create partition, hr=%08lx", hr);

@@ -285,6 +285,88 @@ void whpx_vcpu_kick(CPUState *cpu)
  * Memory support.
  */
 
+/*
+ * Sections mapped with WHvMapGpaRangeFlagTrackDirtyPages: page-aligned
+ * writable RAM, while tracking is enabled. Must mirror the mapping
+ * conditions in whpx_set_phys_mem(). If tracking got disabled after a
+ * section was already mapped with the flag, this under-reports — safe,
+ * because a false result only means falling back to all-dirty.
+ */
+static bool whpx_section_tracked(MemoryRegionSection *section)
+{
+    MemoryRegion *area = section->mr;
+    uint64_t page_size = qemu_real_host_page_size();
+
+    return whpx_global.dirty_page_tracking &&
+           memory_region_is_ram(area) &&
+           !area->readonly && !area->rom_device &&
+           QEMU_IS_ALIGNED(int128_get64(section->size), page_size) &&
+           QEMU_IS_ALIGNED(section->offset_within_address_space, page_size);
+}
+
+/*
+ * Read-and-reset the hypervisor's dirty bitmap for the section and
+ * forward it, run-coalesced, into QEMU's dirty bitmap. A failing query
+ * degrades to marking the whole section dirty.
+ *
+ * cpu_physical_memory_set_dirty_lebitmap() would apply the bitmap in
+ * one call, but it is compiled out on Windows hosts (ram_addr.h), so
+ * runs of set pages go through memory_region_set_dirty() instead.
+ */
+static void whpx_query_and_apply_dirty(MemoryRegionSection *section)
+{
+    struct whpx_state *whpx = &whpx_global;
+    MemoryRegion *mr = section->mr;
+    uint64_t page_size = qemu_real_host_page_size();
+    uint64_t gpa = section->offset_within_address_space;
+    uint64_t size = int128_get64(section->size);
+    uint64_t npages = size / page_size;
+    uint32_t bitmap_size = ROUND_UP(npages, 64) / 8;
+    uint64_t page, run_start = 0;
+    bool in_run = false;
+    HRESULT hr;
+
+    if (bitmap_size > whpx->dirty_bitmap_size) {
+        whpx->dirty_bitmap = g_realloc(whpx->dirty_bitmap, bitmap_size);
+        whpx->dirty_bitmap_size = bitmap_size;
+    }
+
+    hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa, size,
+                                                  whpx->dirty_bitmap,
+                                                  bitmap_size);
+    if (FAILED(hr)) {
+        warn_report_once("WHPX: dirty bitmap query failed, hr=%08lx; "
+                         "marking range fully dirty", hr);
+        memory_region_set_dirty(mr, section->offset_within_region, size);
+        return;
+    }
+
+    page = 0;
+    while (page < npages) {
+        if (!in_run && (page % 64) == 0 && whpx->dirty_bitmap[page / 64] == 0) {
+            page += 64;
+            continue;
+        }
+        if (whpx->dirty_bitmap[page / 64] & (1ULL << (page % 64))) {
+            if (!in_run) {
+                run_start = page;
+                in_run = true;
+            }
+        } else if (in_run) {
+            memory_region_set_dirty(mr,
+                section->offset_within_region + run_start * page_size,
+                (page - run_start) * page_size);
+            in_run = false;
+        }
+        page++;
+    }
+    if (in_run) {
+        memory_region_set_dirty(mr,
+            section->offset_within_region + run_start * page_size,
+            (npages - run_start) * page_size);
+    }
+}
+
 static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -312,6 +394,15 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
     }
 
     if (!add) {
+        /*
+         * Harvest pending dirty info before the mapping (and the
+         * hypervisor-side bitmap with it) disappears: VGA bank
+         * switching unmaps windows wholesale, and writes since the
+         * last sync would otherwise be lost.
+         */
+        if (whpx_section_tracked(section)) {
+            whpx_query_and_apply_dirty(section);
+        }
         hr = whp_dispatch.WHvUnmapGpaRange(whpx->partition,
                 gva, size);
         if (FAILED(hr)) {
@@ -323,13 +414,40 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
 
     flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute
      | (writable ? WHvMapGpaRangeFlagWrite : 0);
+    if (writable && whpx->dirty_page_tracking &&
+        memory_region_is_ram(area)) {
+        flags |= WHvMapGpaRangeFlagTrackDirtyPages;
+    }
     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
 
     hr = whp_dispatch.WHvMapGpaRange(whpx->partition,
          mem, gva, size, flags);
+    if (FAILED(hr) && (flags & WHvMapGpaRangeFlagTrackDirtyPages)) {
+        /*
+         * Sticky fallback: some hypervisor versions accept the
+         * capability query but reject the flag. Without it every
+         * section reads as untracked and log_sync degrades to
+         * all-dirty, which is always correct.
+         */
+        warn_report("WHPX: TrackDirtyPages mapping rejected, hr=%08lx; "
+                    "disabling dirty-page tracking", hr);
+        whpx->dirty_page_tracking = false;
+        flags &= ~WHvMapGpaRangeFlagTrackDirtyPages;
+        hr = whp_dispatch.WHvMapGpaRange(whpx->partition,
+             mem, gva, size, flags);
+    }
     if (FAILED(hr)) {
         error_report("WHPX: failed to map GPA range");
         abort();
+    }
+
+    /*
+     * A fresh mapping starts with a clean hypervisor bitmap whatever
+     * the memory contains; make the next sync treat it as fully dirty
+     * so consumers (VGA) re-read it.
+     */
+    if (writable && memory_region_is_ram(area)) {
+        memory_region_set_dirty(area, section->offset_within_region, size);
     }
 }
 
@@ -398,7 +516,18 @@ static void whpx_log_sync(MemoryListener *listener,
         return;
     }
 
-    memory_region_set_dirty(mr, 0, int128_get64(section->size));
+    if (whpx_section_tracked(section)) {
+        whpx_query_and_apply_dirty(section);
+    } else {
+        /*
+         * No tracking: pessimistically mark the whole section dirty.
+         * Note [offset_within_region, +size): marking [0, size) as
+         * before under-marked sections that alias into the middle of
+         * their region (banked VRAM windows).
+         */
+        memory_region_set_dirty(mr, section->offset_within_region,
+                                int128_get64(section->size));
+    }
 }
 
 static MemoryListener whpx_memory_listener = {

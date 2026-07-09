@@ -42,6 +42,18 @@ struct whpx_state {
     struct whpx_breakpoints breakpoints;
     bool step_pending;
 
+    /*
+     * Hardware dirty-page tracking (Win10 1903+): latched at accel init
+     * when both the capability bit and the WHvQueryGpaRangeDirtyBitmap
+     * export are present; cleared for good if the hypervisor rejects a
+     * TrackDirtyPages mapping. While clear, whpx_log_sync() falls back
+     * to marking whole sections dirty. dirty_bitmap is the query
+     * scratch buffer, grown on demand.
+     */
+    bool dirty_page_tracking;
+    UINT64 *dirty_bitmap;
+    uint32_t dirty_bitmap_size;
+
     bool kernel_irqchip_allowed;
     bool kernel_irqchip_required;
 
@@ -120,6 +132,10 @@ void whpx_apic_get(APICCommonState *s);
         (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, \
         WHV_VIRTUAL_PROCESSOR_STATE_TYPE StateType, PVOID Buffer, \
         UINT32 BufferSizeInBytes)) \
+  X(HRESULT, WHvQueryGpaRangeDirtyBitmap, \
+        (WHV_PARTITION_HANDLE Partition, \
+        WHV_GUEST_PHYSICAL_ADDRESS GuestAddress, UINT64 RangeSizeInBytes, \
+        UINT64 *Bitmap, UINT32 BitmapSizeInBytes)) \
   LIST_WINHVPLATFORM_FUNCTIONS_SUPPLEMENTAL_ARCH(X)
 
 #define WHP_DEFINE_TYPE(return_type, function_name, signature) \
