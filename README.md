@@ -103,18 +103,73 @@ The win64 core includes the Glide and OpenGL pass-through devices from
 [qemu-3dfx](https://github.com/kjliew/qemu-3dfx). Games inside the guest
 render on the host GPU; finished frames are read back and presented
 through the frontend like any other core output — no extra window
-appears. To use it, install the qemu-3dfx guest wrappers inside the VM
-(the Glide DLLs / OpenGL ICD from that project). Direct3D games can work
-through a D3D-to-OpenGL wrapper (e.g. WineD3D) on top of it.
+appears.
 
-Notes:
+**What it accelerates:** the 3D APIs of the late-90s/early-2000s —
+**Glide** (3dfx Voodoo), **OpenGL**, and **Direct3D** (bridged in-guest by
+a D3D-to-OpenGL wrapper such as WineD3D). It is *application-level* API
+pass-through, not a virtual GPU: the Windows desktop itself still draws on
+the emulated Cirrus/VGA card, and modern APIs (DX10+, Vulkan, core-profile
+GL) are not bridged. This is an XP/9x-era games feature.
 
-- **Frame pacing:** the core deliberately disables host vsync on the
-  offscreen swap chain, so old games that relied on vsync as their speed
-  limit will run uncapped. Cap them per game with qemu-3dfx's `FpsLimit`
-  config: put `glide.cfg` (Glide) or `mesagl.cfg` (OpenGL) containing a
-  line like `FpsLimit,60` next to your content / `.qemu_cmd_line` file.
+**Easiest path — the EmuVR VM Wizard.** The wizard's *3D acceleration kit*
+builds a setup CD that installs the correct files for the guest OS and
+writes the host-side config for you. The rest of this section documents
+what that automates, for hand setup.
+
+### Installing the guest wrappers
+
+The wrappers are **signature-locked to the core build** (they check a
+build stamp against the pass-through device and fail *silently* if it
+doesn't match — no error, 3D just never engages). Use the wrappers that
+ship with your core (the wizard bundles the matching set); if you build
+your own core, rebuild the wrappers from the same qemu-3dfx checkout.
+
+**Windows 95 / 98 / ME:**
+
+- Copy `FXMEMMAP.VXD` to `C:\WINDOWS\SYSTEM\`. This kernel shim is opened
+  by *every* wrapper — without it both Glide and OpenGL fail silently.
+- **Glide:** copy `GLIDE.DLL`, `GLIDE2X.DLL`, `GLIDE3X.DLL` to
+  `C:\WINDOWS\SYSTEM\`, then pick the "3dfx Glide" renderer in-game.
+- **OpenGL:** put the wrapper `OPENGL32.DLL` in the *game's own folder*
+  (never a system folder).
+- Copying to a directory on Win9x must name the file explicitly
+  (`copy A.VXD C:\WINDOWS\SYSTEM\A.VXD`) — a trailing-backslash
+  destination is silently rejected by `COMMAND.COM`.
+
+**Windows 2000 / XP:**
+
+- Copy `FXPTL.SYS` to `C:\WINDOWS\system32\drivers\` and run `INSTDRV.EXE`
+  once. This creates the auto-start `MAPMEM` service that *all*
+  pass-through (OpenGL **and** Glide) needs; it's idempotent.
+- **OpenGL:** put the wrapper `OPENGL32.DLL` in the *game's own folder*,
+  not `system32` (there it would shadow the host driver).
+- **Glide:** `GLIDE*.DLL` alongside the game (or in `system32`).
+- **Direct3D:** drop a WineD3D set (`ddraw`/`d3d8`/`d3d9` + `wined3d`)
+  into the game's folder. This is the most-tested D3D path.
+
+### Host-side config (next to the `.qemu_cmd_line`)
+
+The pass-through devices read their config from the content directory (the
+core `chdir`s there), so these files go **beside your `.qemu_cmd_line`**,
+not in the RetroArch folder:
+
+- `mesagl.cfg` (OpenGL) / `glide.cfg` (Glide).
+- **Era games need `ExtensionsYear,1998` in `mesagl.cfg`.** Unfiltered,
+  a modern GPU's giant `GL_EXTENSIONS` string overflows fixed buffers in
+  90s games and they crash on GL init (Quake II is a classic offender).
+  The device log shows `Year ALL` when the cfg wasn't found — use that to
+  confirm placement.
+- **WineD3D needs the opposite** — modern GL — so *omit* the
+  `ExtensionsYear` cap for Direct3D titles. Keep per-game configs.
+- **Frame pacing:** the core disables host vsync on the offscreen swap
+  chain, so games that relied on vsync as their speed limit run uncapped.
+  Cap per game with `FpsLimit,60` in `glide.cfg`/`mesagl.cfg`.
+
+### Limitations
+
 - The asynchronous readback adds one frame of display latency.
+- Save states are unreliable while 3D pass-through is active.
 
 ## Examples
 
