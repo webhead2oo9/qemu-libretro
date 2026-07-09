@@ -166,7 +166,7 @@ static bool frame_acquire(void)
 // Notifications. QEMU reports errors from arbitrary threads, but libretro
 // environment calls are only safe from the frontend thread, so messages
 // queue here and retro_run delivers them.
-#define PENDING_MSGS_LEN 8
+#define PENDING_MSGS_LEN 32
 static pthread_mutex_t msg_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct pending_msg {
 	char *msg;
@@ -174,6 +174,7 @@ static struct pending_msg {
 	enum retro_log_level level;
 } pending_msgs[PENDING_MSGS_LEN];
 static size_t num_pending_msgs = 0;
+static unsigned num_dropped_msgs = 0; // under msg_mutex
 
 static const QKeyCode key_map[RETROK_LAST] = {
 #define KEY(q, r) [RETROK_##r] = Q_KEY_CODE_##q
@@ -980,17 +981,23 @@ void vreport(report_type type, const char *fmt, va_list ap)
 	// calls are only safe on the frontend thread — queue the message for
 	// retro_run to deliver.
 	pthread_mutex_lock(&msg_mutex);
-	if (num_pending_msgs < PENDING_MSGS_LEN) {
-		pending_msgs[num_pending_msgs++] = (struct pending_msg){
-			.msg = msg,
-			.duration = duration,
-			.level = level,
-		};
-		msg = NULL;
+	if (num_pending_msgs == PENDING_MSGS_LEN) {
+		// Drop the oldest, not the newest: a failing boot produces a
+		// burst, and whatever comes after the burst is what the user
+		// still needs to see. The drops themselves are reported by
+		// flush_pending_messages.
+		g_free(pending_msgs[0].msg);
+		memmove(&pending_msgs[0], &pending_msgs[1],
+			(PENDING_MSGS_LEN - 1) * sizeof(pending_msgs[0]));
+		num_pending_msgs--;
+		num_dropped_msgs++;
 	}
+	pending_msgs[num_pending_msgs++] = (struct pending_msg){
+		.msg = msg,
+		.duration = duration,
+		.level = level,
+	};
 	pthread_mutex_unlock(&msg_mutex);
-
-	g_free(msg);
 
 	// Deliberately non-fatal: QEMU calls error_report() for plenty of
 	// recoverable conditions (failed device emulation, bad options, I/O
@@ -1004,12 +1011,28 @@ static void flush_pending_messages(void)
 {
 	struct pending_msg local[PENDING_MSGS_LEN];
 	size_t n;
+	unsigned dropped;
 
 	pthread_mutex_lock(&msg_mutex);
 	n = num_pending_msgs;
 	memcpy(local, pending_msgs, n * sizeof(local[0]));
 	num_pending_msgs = 0;
+	dropped = num_dropped_msgs;
+	num_dropped_msgs = 0;
 	pthread_mutex_unlock(&msg_mutex);
+
+	// Delivered before the retained tail so the on-screen order
+	// matches what actually happened.
+	if (dropped && n < PENDING_MSGS_LEN) {
+		memmove(&local[1], &local[0], n * sizeof(local[0]));
+		local[0] = (struct pending_msg){
+			.msg = g_strdup_printf(
+				"(%u earlier QEMU messages dropped)", dropped),
+			.duration = 5000,
+			.level = RETRO_LOG_WARN,
+		};
+		n++;
+	}
 
 	for (size_t i = 0; i < n; i++) {
 		bool shown = cb_env(RETRO_ENVIRONMENT_SET_MESSAGE_EXT,
