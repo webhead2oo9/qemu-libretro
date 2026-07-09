@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "ui/libretro-vars.h"
 
 #include "mesagl_impl.h"
 
@@ -1666,6 +1667,13 @@ static void conf_MGLOptions(void)
         }
         fclose(fp);
     }
+    /* libretro core-option overrides beat cfg-file values; -1 = auto.
+     * Applied outside the fopen branch so a missing cfg file gets them
+     * too. */
+    if (libretro_cfg_fps_limit >= 0)
+        cfg_fpsLimit = libretro_cfg_fps_limit & 0x7FU;
+    if (libretro_cfg_ext_year >= 0)
+        cfg_xYear = libretro_cfg_ext_year;
 }
 
 int ContextUseSRGB(void)

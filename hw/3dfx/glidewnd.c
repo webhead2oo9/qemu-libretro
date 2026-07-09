@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
+#include "ui/libretro-vars.h"
 
 #include "glide2x_impl.h"
 
@@ -293,6 +294,12 @@ void init_window(const int res, const char *wndTitle, void *opaque)
 	}
         fclose(fp);
     }
+
+    /* libretro core-option override beats the cfg-file value; -1 = auto.
+     * Applied outside the fopen branch so a missing cfg file gets it
+     * too. (Glide has no ExtensionsYear.) */
+    if (libretro_cfg_fps_limit >= 0)
+        cfg_fpsLimit = libretro_cfg_fps_limit & 0x7FU;
 
     int gui_height, glide_fullscreen = glide_gui_fullscreen(0, &gui_height);
     cfg_scaleGuiOff = (glide_fullscreen || cfg_scaleX)? 1:cfg_scaleGuiOff;

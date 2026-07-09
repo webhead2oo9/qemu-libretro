@@ -17,6 +17,7 @@
 #include "sysemu/runstate.h"
 #include "ui/console.h"
 #include "ui/kbd-state.h"
+#include "ui/libretro-vars.h"
 #include "audio/audio.h"
 #include "audio/audio_int.h"
 
@@ -77,6 +78,52 @@ static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Injection bottom half; created on the emu thread once the console
 // exists, scheduled by retro_run after each poll (legal from any thread).
 static QEMUBH *input_bh;
+
+// Core options (v0 API — RetroArch 1.7.5 has SET_VARIABLES/GET_VARIABLE
+// only). Boot-time snapshots (opt_*) are written on the frontend thread
+// in retro_load_game BEFORE the emu thread is created, so emu_thread_fn
+// reads them without locking (happens-before via pthread_create); 0/NULL
+// means auto = leave the command line alone. mouse_speed_pct is frontend
+// thread only. The two 3dfx overrides are declared in ui/libretro-vars.h
+// and sampled by hw/mesa and hw/3dfx on emu/vCPU threads at 3D context
+// creation; -1 = auto (defined here so non-3dfx builds still link).
+volatile int libretro_cfg_fps_limit = -1;
+volatile int libretro_cfg_ext_year = -1;
+
+struct choice {
+	const char *str;
+	int val;
+};
+static const struct choice ram_choices[] = {
+	{ "64 MB", 64 },   { "128 MB", 128 }, { "256 MB", 256 },
+	{ "512 MB", 512 }, { "1 GB", 1024 },  { "2 GB", 2048 },
+	{ NULL, 0 },
+};
+static const struct choice boot_choices[] = {
+	{ "hard disk", 'c' },
+	{ "CD-ROM", 'd' },
+	{ "floppy", 'a' },
+	{ NULL, 0 },
+};
+static const struct choice audio_buffer_choices[] = {
+	// -audiodev out.buffer-length takes microseconds.
+	{ "32 ms", 32000 },
+	{ "48 ms", 48000 },
+	{ "64 ms", 64000 },
+	{ "128 ms", 128000 },
+	{ NULL, 0 },
+};
+static const struct choice mouse_speed_choices[] = {
+	{ "50%", 50 },	 { "75%", 75 },	  { "100%", 100 },
+	{ "150%", 150 }, { "200%", 200 }, { NULL, 0 },
+};
+static int opt_ram_mb;
+static char opt_boot_order_char;
+static const char *opt_accel; // "whpx"/"tcg" string literal, or NULL
+static int opt_audio_buffer_us;
+static int mouse_speed_pct = 100;
+static int mouse_rem_x, mouse_rem_y; // sub-unit motion carry; retro_run only
+static unsigned restart_notified_mask; // frontend thread only
 
 // Video. QEMU runs free; publishers — refresh() on the emu thread and the
 // qemu-3dfx readback glue on a vCPU thread, both under the BQL — copy each
@@ -515,6 +562,25 @@ static void audio_callback(void)
 
 static retro_environment_t cb_env;
 
+// v0 format: "Label; value|value|..." — first value is the default, and
+// the frontend UI shows the raw value strings, so they must read well on
+// their own. The frontend copies the array during the call.
+static const struct retro_variable qemu_core_variables[] = {
+	{ "qemu_ram",
+	  "Guest RAM (restart); auto|64 MB|128 MB|256 MB|512 MB|1 GB|2 GB" },
+	{ "qemu_boot_order", "Boot device (restart); auto|hard disk|CD-ROM|floppy" },
+	{ "qemu_accel", "CPU accelerator (restart); auto|WHPX|TCG" },
+	{ "qemu_audio_buffer", "Audio buffer (restart); auto|32 ms|48 ms|64 ms|128 ms" },
+	{ "qemu_mouse_speed", "Mouse speed; 100%|50%|75%|150%|200%" },
+#ifdef CONFIG_QEMU_3DFX
+	{ "qemu_3dfx_fps_limit",
+	  "3D FPS limit (next 3D app); auto|30|60|72|75|100|120|144" },
+	{ "qemu_3dfx_ext_year",
+	  "3D GL extensions year (next 3D app); auto|1998|2000|2002|2004|2006|2008|2010" },
+#endif
+	{ NULL, NULL },
+};
+
 void retro_set_environment(retro_environment_t cb)
 {
 	cb_env = cb;
@@ -534,6 +600,7 @@ void retro_set_environment(retro_environment_t cb)
 		   },
 		   { 0 } });
 	cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir);
+	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void *)qemu_core_variables);
 
 	cb(RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK,
 	   &(struct retro_audio_callback){
@@ -1072,6 +1139,217 @@ static void early_error_report(const char *fmt, ...)
 	emu_thread_exit();
 }
 
+// Non-fatal user-facing notice, deliverable from any thread (rides the
+// vreport queue; retro_run flushes it).
+G_GNUC_PRINTF(1, 2)
+static void notice_report(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vreport(REPORT_TYPE_INFO, fmt, ap);
+	va_end(ap);
+}
+
+// Fetch a core option's current value; frontend thread only. NULL when
+// unset or unavailable; the string is owned by the frontend.
+static const char *get_var(const char *key)
+{
+	struct retro_variable var = { .key = key };
+
+	if (!cb_env || !cb_env(RETRO_ENVIRONMENT_GET_VARIABLE, &var)) {
+		return NULL;
+	}
+	return var.value;
+}
+
+// Unknown/unset/"auto" parse to the auto sentinel (0 here, -1 for the
+// numeric 3dfx options) rather than erroring: a stale options file from
+// an older core version must not break booting.
+static int parse_choice(const struct choice *table, const char *s)
+{
+	if (!s) {
+		return 0;
+	}
+	for (; table->str; table++) {
+		if (!strcmp(table->str, s)) {
+			return table->val;
+		}
+	}
+	return 0;
+}
+
+static const char *parse_accel(const char *s)
+{
+	if (s && !strcmp(s, "WHPX")) {
+		return "whpx";
+	}
+	if (s && !strcmp(s, "TCG")) {
+		return "tcg";
+	}
+	return NULL;
+}
+
+static int parse_int_auto(const char *s)
+{
+	if (!s || !g_ascii_isdigit(s[0])) {
+		return -1;
+	}
+	return atoi(s);
+}
+
+// Read all core options; frontend thread only. On first load (called in
+// retro_load_game before the emu thread exists — 1.7.5 has only loaded
+// its options file by then, retro_set_environment is too early) the
+// boot-time options are snapshotted for emu_thread_fn's argv surgery.
+// Afterwards a boot-time change only earns a one-shot "takes effect on
+// restart" notice; reverting the option re-arms it.
+static void update_variables(bool first_load)
+{
+	int ram = parse_choice(ram_choices, get_var("qemu_ram"));
+	int boot = parse_choice(boot_choices, get_var("qemu_boot_order"));
+	const char *accel = parse_accel(get_var("qemu_accel"));
+	int abuf = parse_choice(audio_buffer_choices,
+				get_var("qemu_audio_buffer"));
+
+	if (first_load) {
+		opt_ram_mb = ram;
+		opt_boot_order_char = boot;
+		opt_accel = accel;
+		opt_audio_buffer_us = abuf;
+	} else {
+		const struct {
+			bool changed;
+			const char *label;
+		} boot_opts[] = {
+			{ ram != opt_ram_mb, "Guest RAM" },
+			{ boot != opt_boot_order_char, "Boot device" },
+			// Pointer compare is exact: parse_accel returns
+			// interned literals or NULL.
+			{ accel != opt_accel, "CPU accelerator" },
+			{ abuf != opt_audio_buffer_us, "Audio buffer" },
+		};
+		for (size_t i = 0; i < G_N_ELEMENTS(boot_opts); i++) {
+			if (!boot_opts[i].changed) {
+				restart_notified_mask &= ~(1u << i);
+			} else if (!(restart_notified_mask & (1u << i))) {
+				restart_notified_mask |= 1u << i;
+				notice_report(
+					"%s change takes effect on restart",
+					boot_opts[i].label);
+			}
+		}
+	}
+
+	int speed = parse_choice(mouse_speed_choices,
+				 get_var("qemu_mouse_speed"));
+	mouse_speed_pct = speed ? speed : 100;
+
+#ifdef CONFIG_QEMU_3DFX
+	libretro_cfg_fps_limit = parse_int_auto(get_var("qemu_3dfx_fps_limit"));
+	libretro_cfg_ext_year = parse_int_auto(get_var("qemu_3dfx_ext_year"));
+#endif
+}
+
+// argv surgery for the boot-time option overrides. args holds g_strdup'd
+// tokens; only "-"-prefixed flag tokens are matched, so argv[0] (the
+// qemu-system-ARCH word) is never touched.
+static int args_find(GPtrArray *args, const char *flag)
+{
+	for (guint i = 0; i < args->len; i++) {
+		if (!strcmp(args->pdata[i], flag)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Replace the value after an existing flag, or append the pair.
+static void args_set(GPtrArray *args, const char *flag, const char *value)
+{
+	int i = args_find(args, flag);
+
+	if (i >= 0 && (guint)(i + 1) < args->len) {
+		g_free(args->pdata[i + 1]);
+		args->pdata[i + 1] = g_strdup(value);
+	} else {
+		g_ptr_array_add(args, g_strdup(flag));
+		g_ptr_array_add(args, g_strdup(value));
+	}
+}
+
+static void args_remove_all(GPtrArray *args, const char *flag)
+{
+	int i;
+
+	while ((i = args_find(args, flag)) >= 0) {
+		// Take the value with it unless the next token is a flag.
+		guint n = ((guint)(i + 1) < args->len &&
+			   ((char *)args->pdata[i + 1])[0] != '-') ?
+				  2 :
+				  1;
+		g_ptr_array_remove_range(args, i, n);
+	}
+}
+
+// Rewrite out.buffer-length on the libretro audiodev's option string.
+// Only the token following "-audiodev" whose driver is libretro is
+// touched; a command line without one gets a notice instead of a second
+// audiodev (a duplicate id fails qemu_init).
+static void apply_audio_buffer(GPtrArray *args, int usecs)
+{
+	for (guint i = 0; i + 1 < args->len; i++) {
+		if (strcmp(args->pdata[i], "-audiodev") != 0 ||
+		    !g_str_has_prefix(args->pdata[i + 1], "libretro")) {
+			continue;
+		}
+		char **parts = g_strsplit(args->pdata[i + 1], ",", -1);
+		GString *out = g_string_new(NULL);
+		for (char **p = parts; *p; p++) {
+			if (g_str_has_prefix(*p, "out.buffer-length=")) {
+				continue;
+			}
+			if (out->len) {
+				g_string_append_c(out, ',');
+			}
+			g_string_append(out, *p);
+		}
+		g_string_append_printf(out, ",out.buffer-length=%d", usecs);
+		g_strfreev(parts);
+		g_free(args->pdata[i + 1]);
+		args->pdata[i + 1] = g_string_free(out, FALSE);
+		return;
+	}
+	notice_report(
+		"Audio buffer option ignored: no libretro audiodev in the command line");
+}
+
+static void apply_option_overrides(GPtrArray *args)
+{
+	char buf[16];
+
+	if (opt_ram_mb) {
+		g_snprintf(buf, sizeof(buf), "%d", opt_ram_mb);
+		args_set(args, "-m", buf);
+	}
+	if (opt_boot_order_char) {
+		// Wholesale: a pre-existing "-boot menu=on" etc. is replaced;
+		// forcing the boot device is the point of the option.
+		g_snprintf(buf, sizeof(buf), "order=%c", opt_boot_order_char);
+		args_set(args, "-boot", buf);
+	}
+	if (opt_accel) {
+		// Remove the whole fallback chain ("-accel whpx -accel tcg");
+		// appending alone would leave the first entry winning.
+		args_remove_all(args, "-accel");
+		g_ptr_array_add(args, g_strdup("-accel"));
+		g_ptr_array_add(args, g_strdup(opt_accel));
+	}
+	if (opt_audio_buffer_us) {
+		apply_audio_buffer(args, opt_audio_buffer_us);
+	}
+}
+
 static void start_qemu_with_args(const char *argv[])
 {
 	int argc = 0;
@@ -1124,6 +1402,13 @@ static void *emu_thread_fn(void *arg)
 	g_chdir(game_dir);
 	g_free(game_dir);
 
+	// All content branches build argv here so core-option overrides
+	// apply uniformly. Intentionally leaked: start_qemu_with_args blocks
+	// until session end and never copies, and target_arch aliases
+	// pdata[0] and is read again at session end (emu_thread_exit,
+	// retro_unload_game).
+	GPtrArray *args = g_ptr_array_new_with_free_func(g_free);
+
 	if (g_str_has_suffix(game_path, ".qemu_cmd_line")) {
 		char *cmd_line = NULL;
 		// Must start NULL: GLib only stores into a NULL GError*, and
@@ -1156,17 +1441,33 @@ static void *emu_thread_fn(void *arg)
 				argv[0], game_path);
 			return NULL;
 		}
-		target_arch = &argv[0][strlen(QEMU_CMD_PREFIX)];
-		start_qemu_with_args((const char **)argv);
+		for (char **p = argv; *p; p++) {
+			g_ptr_array_add(args, *p);
+		}
+		g_free(argv); // tokens now owned by args
 	} else if (g_str_has_suffix(game_path, ".iso")) {
-		target_arch = DEFAULT_ARCH;
-		start_qemu_with_args((const char *[]){ QEMU_CMD, "-cdrom",
-						       game_path, NULL });
+		const char *base[] = { QEMU_CMD, "-cdrom", game_path, NULL };
+		for (const char **p = base; *p; p++) {
+			g_ptr_array_add(args, g_strdup(*p));
+		}
 	} else {
-		target_arch = DEFAULT_ARCH;
-		start_qemu_with_args(
-			(const char *[]){ QEMU_CMD, game_path, NULL });
+		const char *base[] = { QEMU_CMD, game_path, NULL };
+		for (const char **p = base; *p; p++) {
+			g_ptr_array_add(args, g_strdup(*p));
+		}
 	}
+
+	apply_option_overrides(args);
+	target_arch = (char *)args->pdata[0] + strlen(QEMU_CMD_PREFIX);
+	g_ptr_array_add(args, NULL);
+
+	// The effective command line, post-overrides — the first thing to
+	// ask for in a bug report.
+	char *joined = g_strjoinv(" ", (char **)args->pdata);
+	fprintf(stderr, "qemu-libretro argv: %s\n", joined);
+	g_free(joined);
+
+	start_qemu_with_args((const char **)args->pdata);
 	return NULL;
 }
 
@@ -1184,6 +1485,10 @@ bool retro_load_game(const struct retro_game_info *game)
 	// resolving the moment emu_thread_fn chdirs to the game directory —
 	// so make it absolute while the cwd is still the frontend's.
 	game_path = g_canonicalize_filename(game->path, NULL);
+	// Snapshot the core options before the emu thread exists: the
+	// thread-creation happens-before lets emu_thread_fn read the opt_*
+	// statics without locking.
+	update_variables(true);
 	if (pthread_create(&emu_thread, NULL, emu_thread_fn, NULL) != 0) {
 		return false;
 	}
@@ -1226,6 +1531,67 @@ size_t retro_get_memory_size(unsigned id)
 	return 0;
 }
 
+// Scale a mouse delta by mouse_speed_pct with remainder carry so
+// sub-unit motion at slow speeds accumulates instead of vanishing;
+// exact identity at 100%. Frontend thread only.
+static int scale_mouse(int d, int *rem)
+{
+	long num = (long)d * mouse_speed_pct + *rem;
+	int out = (int)(num / 100);
+
+	*rem = (int)(num - (long)out * 100);
+	return out;
+}
+
+// Throwaway probe (pre-RetroPad scoping — remove with the real mapper):
+// reports what the frontend actually delivers on the joypad/analog
+// interface. Edge-triggered, so silent on frontends that deliver
+// nothing. Frontend thread only.
+static void pad_probe(void)
+{
+	static const char *const btn_names[16] = {
+		"B",	"Y",	 "Select", "Start", "Up", "Down",
+		"Left", "Right", "A",	   "X",	    "L",  "R",
+		"L2",	"R2",	 "L3",	   "R3",
+	};
+	static uint16_t down_prev;
+	static unsigned analog_hold;
+	uint16_t down_now = 0;
+
+	for (unsigned i = 0; i < 16; i++) {
+		if (cb_input_state(0, RETRO_DEVICE_JOYPAD, 0, i)) {
+			down_now |= 1u << i;
+		}
+	}
+	for (unsigned i = 0; i < 16; i++) {
+		if ((down_now ^ down_prev) & (1u << i)) {
+			notice_report("[pad] %s %s", btn_names[i],
+				      (down_now & (1u << i)) ? "down" : "up");
+		}
+	}
+	down_prev = down_now;
+
+	int lx = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				RETRO_DEVICE_INDEX_ANALOG_LEFT,
+				RETRO_DEVICE_ID_ANALOG_X);
+	int ly = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				RETRO_DEVICE_INDEX_ANALOG_LEFT,
+				RETRO_DEVICE_ID_ANALOG_Y);
+	int rx = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+				RETRO_DEVICE_ID_ANALOG_X);
+	int ry = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+				RETRO_DEVICE_ID_ANALOG_Y);
+	if (analog_hold) {
+		analog_hold--;
+	} else if (ABS(lx) > 8192 || ABS(ly) > 8192 || ABS(rx) > 8192 ||
+		   ABS(ry) > 8192) {
+		notice_report("[pad] L(%d,%d) R(%d,%d)", lx, ly, rx, ry);
+		analog_hold = 120; // ~2 s between analog reports
+	}
+}
+
 void retro_run(void)
 {
 	// Last keyboard state this thread saw; used for edge detection
@@ -1233,6 +1599,16 @@ void retro_run(void)
 	static bool key_down_prev[RETROK_LAST];
 
 	cb_input_poll();
+
+	// The frontend flags option changes instead of signalling them;
+	// poll the flag and re-read on demand.
+	bool vars_updated = false;
+	if (cb_env(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &vars_updated) &&
+	    vars_updated) {
+		update_variables(false);
+	}
+
+	pad_probe();
 
 	// Sample all input into locals first — a frontend is free to do
 	// arbitrary work inside input_state, so no lock is held across it.
@@ -1270,8 +1646,8 @@ void retro_run(void)
 
 	pthread_mutex_lock(&input_mutex);
 	// Deltas accumulate: the emu thread consumes them at its own rate.
-	mouse_dx += dx;
-	mouse_dy += dy;
+	mouse_dx += scale_mouse(dx, &mouse_rem_x);
+	mouse_dy += scale_mouse(dy, &mouse_rem_y);
 	memcpy(buttons_down, btn, sizeof(buttons_down));
 	wheel_accum += wheel;
 

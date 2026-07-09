@@ -48,6 +48,38 @@ audio flags shown above are *not* added automatically, so include
 `-audiodev libretro,id=snd0 -machine pcspk-audiodev=snd0 -device …,audiodev=snd0`
 yourself if you want sound.
 
+### Core options
+
+Common knobs are also exposed as core options (in RetroArch: Quick Menu →
+Options), so many setups need no hand-edited command line at all:
+
+- **Guest RAM**, **Boot device**, **CPU accelerator**, **Audio buffer** —
+  take effect on the next restart of the content.
+- **Mouse speed** — live.
+- **3D FPS limit**, **3D GL extensions year** — global defaults for the
+  qemu-3dfx pass-through; picked up when the guest starts its next 3D app.
+
+Every option defaults to `auto`, which changes nothing. A non-auto value
+*overrides* the command line: the matching flag is replaced if present and
+appended if missing. Specifics:
+
+- **CPU accelerator** replaces *all* `-accel` entries (fallback chains
+  included) with the chosen one — handy for pinning a stubborn guest to
+  TCG without editing files. If your command line uses the
+  `-machine accel=…` spelling instead of `-accel`, the two will conflict;
+  use the `-accel` form.
+- **Audio buffer** rewrites `out.buffer-length` on the libretro audiodev,
+  and is skipped (with a notice) when the command line has no libretro
+  audiodev.
+- The **3D** options override `FpsLimit`/`ExtensionsYear` after the cfg
+  files are read — precedence is core option > per-game
+  `mesagl.cfg`/`glide.cfg` > built-in — and the cfg files are never
+  written to.
+
+On RetroArch 1.7.5-era frontends (EmuVR) core options are global to the
+core, not per-game; per-game tuning still belongs in the
+`.qemu_cmd_line` and the 3dfx cfg files.
+
 ### Hardware virtualization (Windows)
 
 Add this to the start of your command for near-native CPU speed:
