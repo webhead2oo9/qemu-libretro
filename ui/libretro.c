@@ -75,6 +75,9 @@ static QEMUBH *input_bh;
 struct frame_slot {
 	uint8_t *buf;
 	int w, h;
+	// glReadPixels row order; the flip happens on the frontend thread
+	// at acquire time, not on the BQL-holding publisher.
+	bool bottom_up;
 };
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct frame_slot pending_frame; // under frame_mutex
@@ -117,6 +120,29 @@ static bool frame_acquire(void)
 		fresh = true;
 	}
 	pthread_mutex_unlock(&frame_mutex);
+
+	// 3D frames arrive in glReadPixels order; flip them here, outside
+	// the lock, so the vCPU that published never pays for it.
+	if (fresh && present_frame.bottom_up) {
+		static uint8_t *row;
+		static size_t row_size;
+		size_t stride = (size_t)present_frame.w * 4;
+
+		if (row_size < stride) {
+			row = g_realloc(row, stride);
+			row_size = stride;
+		}
+		for (int y = 0; y < present_frame.h / 2; y++) {
+			uint8_t *top = present_frame.buf + (size_t)y * stride;
+			uint8_t *bot = present_frame.buf +
+				       (size_t)(present_frame.h - 1 - y) *
+					       stride;
+			memcpy(row, top, stride);
+			memcpy(top, bot, stride);
+			memcpy(bot, row, stride);
+		}
+		present_frame.bottom_up = false;
+	}
 
 	return fresh;
 }
@@ -652,6 +678,7 @@ static void refresh(DisplayChangeListener *dcl)
 				       src + (size_t)y * stride, w * 4);
 			}
 		}
+		pending_frame.bottom_up = false;
 		pending_updated = true;
 		pthread_mutex_unlock(&frame_mutex);
 	}
@@ -660,17 +687,14 @@ static void refresh(DisplayChangeListener *dcl)
 #ifdef CONFIG_QEMU_3DFX
 // qemu-3dfx frame sink (see ui/libretro-3dfx.c). publish arrives from a
 // vCPU thread under the BQL with the finished 3D frame; rows come
-// bottom-up from glReadPixels and BGRA bytes already match XRGB8888.
+// bottom-up from glReadPixels (flipped at acquire time on the frontend
+// thread) and BGRA bytes already match XRGB8888.
 static void fx_sink_publish(const void *pixels, int w, int h)
 {
-	const uint8_t *src = pixels;
-
 	pthread_mutex_lock(&frame_mutex);
 	pending_ensure(w, h);
-	for (int y = 0; y < h; y++) {
-		memcpy(pending_frame.buf + (size_t)y * w * 4,
-		       src + (size_t)(h - 1 - y) * w * 4, (size_t)w * 4);
-	}
+	memcpy(pending_frame.buf, pixels, (size_t)w * h * 4);
+	pending_frame.bottom_up = true;
 	pending_updated = true;
 	pthread_mutex_unlock(&frame_mutex);
 

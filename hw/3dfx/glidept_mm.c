@@ -348,8 +348,11 @@ static void processArgs(GlidePTState *s)
                     wrWriteRegion(1, 0, 0, 0, s->lfb_w, s->lfb_h, 0x800, (uintptr_t)(s->glfb_ptr));
                 s->lfb_dirty = 1;
             }
-            if (glide_vsyncoff())
-                s->arg[0] = 0;
+            /* qemu-libretro: the wrapper swaps a hidden window on a
+             * vCPU thread holding the BQL; a vsynced swap stalls the
+             * whole machine. Force the swap interval to 0 — pacing
+             * belongs to the frontend (per-game FpsLimit still works) */
+            s->arg[0] = 0;
             DPRINTF_COND((GRFuncTrace() == 2), ">>>>>>>> _grBufferSwap <<<<<<<<");
             s->perfs.stat();
             /* qemu-libretro: LFB writes are flushed and the wrapper has

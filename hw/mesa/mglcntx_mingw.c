@@ -346,11 +346,12 @@ int MGLMakeCurrent(uint32_t cntxRC, int level)
         wglFuncs.MakeCurrent(hDC, hRC[n]);
         InitMesaGLExt();
         wrContextSRGB(ContextUseSRGB());
-        if (ContextVsyncOff()) {
-            const int val = 0;
-            if (wglFuncs.SwapIntervalEXT)
-                wglFuncs.SwapIntervalEXT(val);
-        }
+        /* qemu-libretro: swaps target a hidden window nobody sees, and
+         * they run on a vCPU thread holding the BQL — a vsynced swap
+         * stalls the whole machine for up to a display period. Force
+         * the interval off; frame pacing belongs to the frontend. */
+        if (wglFuncs.SwapIntervalEXT)
+            wglFuncs.SwapIntervalEXT(0);
         if (!n)
             MGLActivateHandler(1, 0);
     }
@@ -533,6 +534,10 @@ void MGLFuncHandler(const char *name)
     FUNCP_HANDLER("wglSwapIntervalEXT") {
         if (wglFuncs.SwapIntervalEXT) {
             uint32_t ret, err;
+            /* qemu-libretro: never let the guest re-enable vsync on the
+             * hidden window (see MGLMakeCurrent); accept the call but
+             * clamp every request to interval 0 */
+            argsp[0] = 0;
             int curr = wglFuncs.GetSwapIntervalEXT();
             if (curr != argsp[0]) {
                 ret =  wglFuncs.SwapIntervalEXT(argsp[0]);
