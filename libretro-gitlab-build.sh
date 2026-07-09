@@ -95,6 +95,7 @@ case "$platform" in
                     "--enable-whpx"
                     "--enable-qemu-3dfx"
                 )
+                WITH_QEMU_3DFX=1
                 ;;
         esac
         ;;
@@ -187,3 +188,22 @@ CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
 BUILD_OUT=libqemu_libretro.$LIB_EXT
 make -j$NUMPROC $BUILD_OUT
 cp $BUILD_OUT ../qemu_$CORE_SUFFIX.$LIB_EXT
+
+# qemu-3dfx guest wrappers verify a commit signature stamped at build time
+# against the host device's rev_[]; a mismatch fails silently inside the
+# guest (wrapper DllMain returns FALSE, no log). Publish the signature next
+# to the core so the EmuVR VM Wizard can reject an ISO whose 3D kit doesn't
+# match the deployed core BEFORE the guest silently fails. The signature is
+# defined identically in hw/3dfx/g2xfuncs.h and hw/mesa/mglfuncs.h — read
+# both and refuse to publish a marker if they disagree.
+if [ "${WITH_QEMU_3DFX:-}" = "1" ]; then
+    SIGN_3DFX=$(sed -n 's/.*const char rev_\[\] = "\([^"]*\)".*/\1/p' \
+        ../hw/3dfx/g2xfuncs.h | head -1)
+    SIGN_MESA=$(sed -n 's/.*const char rev_\[\] = "\([^"]*\)".*/\1/p' \
+        ../hw/mesa/mglfuncs.h | head -1)
+    if [ -z "$SIGN_3DFX" ] || [ "$SIGN_3DFX" != "$SIGN_MESA" ]; then
+        echo "qemu-3dfx signature extraction failed: 3dfx='$SIGN_3DFX' mesa='$SIGN_MESA'" >&2
+        exit 1
+    fi
+    printf '%s\n' "$SIGN_3DFX" > ../qemu-3dfx-build-id.txt
+fi

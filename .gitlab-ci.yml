@@ -145,6 +145,11 @@ libretro-build-windows-x64:
   extends:
     - .libretro-windows-x64-mingw-make-default
     - .core-defs
+  artifacts:
+    paths:
+      - ${CORENAME}_libretro.dll
+      - qemu-3dfx-build-id.txt
+    expire_in: 10 min
 
 # Windows 32-bit
 libretro-build-windows-i686:
