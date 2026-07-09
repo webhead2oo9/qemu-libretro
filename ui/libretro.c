@@ -41,12 +41,28 @@ static bool emu_thread_joined = false;
 
 static HWVoiceOut *hw_voice_out = NULL;
 static pthread_mutex_t hw_voice_out_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Signaled when the emu thread buffers samples; audio_callback waits on
+// it (bounded) instead of returning empty-handed, because the frontend's
+// audio-callback thread re-invokes the callback in a tight loop and an
+// instant return busy-spins a host core whenever the guest is silent —
+// which includes the entire boot, before the voice even opens.
+static pthread_cond_t hw_voice_out_cond = PTHREAD_COND_INITIALIZER;
 
-// Input. Written by the frontend thread (retro_run / keyboard callback),
-// consumed on the main loop thread by input_inject_bh; the two run
-// concurrently, so all access goes through input_mutex. Mouse deltas and
-// wheel detents accumulate because the two sides tick at independent
-// rates.
+// Input. Written by the frontend thread (retro_run), consumed on the main
+// loop thread by input_inject_bh; the two run concurrently, so all access
+// goes through input_mutex. Mouse deltas and wheel detents accumulate
+// because the two sides tick at independent rates.
+//
+// The keyboard is POLLED via RETRO_DEVICE_KEYBOARD instead of taken from
+// the keyboard-event callback: RetroArch 1.7.5's callback path drops the
+// extended-key bit before translating scancodes (arrows arrive as keypad
+// digits, right Ctrl as left Ctrl), swallows every event while the
+// frontend's on-screen-keyboard toggle (F12) is latched, and emits a
+// bogus RETROK_UNKNOWN pseudo-keydown per typed character — while its
+// polled path translates correctly and is gated by none of that. The
+// callback stays registered as a capability hint (newer frontends
+// auto-enable Game Focus for cores that register one) but its events are
+// ignored.
 #define KEY_EVENT_QUEUE_LEN 64
 struct key_event {
 	bool down;
@@ -344,13 +360,27 @@ void retro_get_system_info(struct retro_system_info *info)
 }
 
 static pthread_mutex_t av_info_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool changed_av_info = false;
+// Geometry and timing changes are delivered differently: geometry rides
+// RETRO_ENVIRONMENT_SET_GEOMETRY, which is cheap and safe every frame,
+// while timing needs SET_SYSTEM_AV_INFO — which RetroArch 1.7.5 answers
+// with a full teardown/reinit of the video, audio AND input drivers. That
+// reinit destroys the window mid-session, drops the Game Focus keyboard
+// grab (the recreated dinput device loses its hotkey-block flags, so
+// guest typing suddenly triggers frontend hotkeys) and restarts the audio
+// thread. Guests switch video modes several times per boot, so geometry
+// must never take the SET_SYSTEM_AV_INFO path.
+static bool changed_geometry = false;
+static bool changed_timing = false;
 static struct retro_system_av_info av_info = {
 	.geometry = {
-		.base_width = 100,
-		.base_height = 100,
-		.max_width = 100,
-		.max_height = 100,
+		// base_* track the guest mode; max_* are a fixed ceiling no
+		// supported guest mode exceeds (Cirrus/std VGA top out at
+		// 1600x1200), because raising max_* would need exactly the
+		// SET_SYSTEM_AV_INFO reinit described above.
+		.base_width = 640,
+		.base_height = 480,
+		.max_width = 1920,
+		.max_height = 1200,
 		.aspect_ratio = 0.0,
 	},
 	.timing = {
@@ -369,15 +399,14 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 static void keyboard_event(bool down, unsigned keycode, uint32_t character,
 			   uint16_t key_modifiers)
 {
-	if (keycode >= RETROK_LAST) {
-		return;
-	}
-	QKeyCode qc = key_map[keycode];
-	if (!qc) {
-		return;
-	}
+	// Intentionally ignored — the keyboard is polled in retro_run (see
+	// the input comment block above). Registration alone is what makes
+	// newer frontends offer automatic Game Focus.
+}
 
-	pthread_mutex_lock(&input_mutex);
+// input_mutex held.
+static void enqueue_key_locked(bool down, QKeyCode qc)
+{
 	if (num_pending_keys == KEY_EVENT_QUEUE_LEN) {
 		// Drop the oldest event rather than the newest: dropping a
 		// key-up leaves the guest with a stuck key.
@@ -389,7 +418,23 @@ static void keyboard_event(bool down, unsigned keycode, uint32_t character,
 		.down = down,
 		.key = qc,
 	};
-	pthread_mutex_unlock(&input_mutex);
+}
+
+static bool key_is_modifier(unsigned k)
+{
+	switch (k) {
+	case RETROK_LSHIFT:
+	case RETROK_RSHIFT:
+	case RETROK_LCTRL:
+	case RETROK_RCTRL:
+	case RETROK_LALT:
+	case RETROK_RALT:
+	case RETROK_LMETA:
+	case RETROK_RMETA:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static retro_audio_sample_t cb_audio_sample;
@@ -408,6 +453,21 @@ void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb)
 
 static void audio_callback(void)
 {
+	// If nothing is buffered, wait for samples — but bounded, because
+	// the frontend's pause and driver-reinit paths block until an
+	// in-flight callback returns.
+	pthread_mutex_lock(&hw_voice_out_mutex);
+	if (!hw_voice_out || !hw_voice_out->pending_emul) {
+		gint64 deadline = g_get_real_time() + 20000; // 20 ms
+		struct timespec ts = {
+			.tv_sec = deadline / G_USEC_PER_SEC,
+			.tv_nsec = (long)(deadline % G_USEC_PER_SEC) * 1000,
+		};
+		pthread_cond_timedwait(&hw_voice_out_cond, &hw_voice_out_mutex,
+				       &ts);
+	}
+	pthread_mutex_unlock(&hw_voice_out_mutex);
+
 	// Copy samples out under the lock but call the frontend without it:
 	// holding the voice mutex across cb_audio_sample_batch stalls the emu
 	// thread's audio timer (and with it the whole machine) whenever the
@@ -536,9 +596,14 @@ static int audio_init_out(HWVoiceOut *hw, struct audsettings *as,
 		return -1;
 	}
 
+	// Only flag a change on a genuine rate difference: the default
+	// (44100) matches the advertised timing, and SET_SYSTEM_AV_INFO is
+	// a full driver reinit on RetroArch 1.7.5 (see av_info comment).
 	pthread_mutex_lock(&av_info_lock);
-	av_info.timing.sample_rate = as->freq;
-	changed_av_info = true;
+	if (av_info.timing.sample_rate != as->freq) {
+		av_info.timing.sample_rate = as->freq;
+		changed_timing = true;
+	}
 	pthread_mutex_unlock(&av_info_lock);
 
 	CALL_QEMU_FUNC(audio_pcm_init_info, &hw->info, as);
@@ -564,6 +629,8 @@ static void audio_fini_out(HWVoiceOut *hw)
 	pthread_mutex_lock(&hw_voice_out_mutex);
 	g_assert(hw_voice_out == hw);
 	hw_voice_out = NULL;
+	// Wake a waiting audio_callback so it notices the voice is gone.
+	pthread_cond_broadcast(&hw_voice_out_cond);
 	pthread_mutex_unlock(&hw_voice_out_mutex);
 }
 
@@ -599,6 +666,7 @@ static size_t audio_put_buffer_out(HWVoiceOut *hw, void *buf, size_t size)
 	pthread_mutex_lock(&hw_voice_out_mutex);
 	size_t ret =
 		CALL_QEMU_FUNC(audio_generic_put_buffer_out, hw, buf, size);
+	pthread_cond_signal(&hw_voice_out_cond);
 	pthread_mutex_unlock(&hw_voice_out_mutex);
 	return ret;
 }
@@ -630,9 +698,9 @@ static void gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
 						surface_height(surface) == h);
 	if (changed_resolution) {
 		pthread_mutex_lock(&av_info_lock);
-		av_info.geometry.base_width = av_info.geometry.max_width = w;
-		av_info.geometry.base_height = av_info.geometry.max_height = h;
-		changed_av_info = true;
+		av_info.geometry.base_width = w;
+		av_info.geometry.base_height = h;
+		changed_geometry = true;
 		pthread_mutex_unlock(&av_info_lock);
 	}
 	surface = new_surface;
@@ -700,9 +768,9 @@ static void fx_sink_publish(const void *pixels, int w, int h)
 	pthread_mutex_lock(&av_info_lock);
 	if (av_info.geometry.base_width != w ||
 	    av_info.geometry.base_height != h) {
-		av_info.geometry.base_width = av_info.geometry.max_width = w;
-		av_info.geometry.base_height = av_info.geometry.max_height = h;
-		changed_av_info = true;
+		av_info.geometry.base_width = w;
+		av_info.geometry.base_height = h;
+		changed_geometry = true;
 	}
 	pthread_mutex_unlock(&av_info_lock);
 }
@@ -725,11 +793,9 @@ static void fx_sink_set_active(bool on)
 		pthread_mutex_lock(&av_info_lock);
 		if (av_info.geometry.base_width != w ||
 		    av_info.geometry.base_height != h) {
-			av_info.geometry.base_width =
-				av_info.geometry.max_width = w;
-			av_info.geometry.base_height =
-				av_info.geometry.max_height = h;
-			changed_av_info = true;
+			av_info.geometry.base_width = w;
+			av_info.geometry.base_height = h;
+			changed_geometry = true;
 		}
 		pthread_mutex_unlock(&av_info_lock);
 	}
@@ -1090,7 +1156,11 @@ bool retro_load_game(const struct retro_game_info *game)
 	// The frontend only guarantees game->path stays valid during this
 	// call, and old frontends (RetroArch 1.7.5-era) reuse the
 	// string quickly, so copy it before the emu thread reads it.
-	game_path = g_strdup(game->path);
+	// Copy = canonicalize: frontends also pass the path relative to
+	// their own cwd (EmuVR launches with "..\Games\..."), which stops
+	// resolving the moment emu_thread_fn chdirs to the game directory —
+	// so make it absolute while the cwd is still the frontend's.
+	game_path = g_canonicalize_filename(game->path, NULL);
 	if (pthread_create(&emu_thread, NULL, emu_thread_fn, NULL) != 0) {
 		return false;
 	}
@@ -1135,31 +1205,71 @@ size_t retro_get_memory_size(unsigned id)
 
 void retro_run(void)
 {
+	// Last keyboard state this thread saw; used for edge detection
+	// against the polled state below. Frontend thread only.
+	static bool key_down_prev[RETROK_LAST];
+
 	cb_input_poll();
 
-	pthread_mutex_lock(&input_mutex);
-	// Deltas accumulate: the emu thread consumes them at its own rate.
-	mouse_dx += cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
-				   RETRO_DEVICE_ID_MOUSE_X);
-	mouse_dy += cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
-				   RETRO_DEVICE_ID_MOUSE_Y);
-
-#define BTN(q, r)                                                              \
-	buttons_down[INPUT_BUTTON_##q] = cb_input_state(                       \
-		0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_##r)
-	BTN(LEFT, LEFT);
-	BTN(RIGHT, RIGHT);
-	BTN(MIDDLE, MIDDLE);
-#undef BTN
+	// Sample all input into locals first — a frontend is free to do
+	// arbitrary work inside input_state, so no lock is held across it.
+	int dx = cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
+				RETRO_DEVICE_ID_MOUSE_X);
+	int dy = cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
+				RETRO_DEVICE_ID_MOUSE_Y);
+	bool btn[INPUT_BUTTON__MAX] = {
+		[INPUT_BUTTON_LEFT] = cb_input_state(
+			0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT),
+		[INPUT_BUTTON_RIGHT] = cb_input_state(
+			0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT),
+		[INPUT_BUTTON_MIDDLE] = cb_input_state(
+			0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE),
+	};
 	// The frontend reports wheel motion as a momentary button; count
 	// detents so none are lost or repeated across injection ticks.
+	int wheel = 0;
 	if (cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
 			   RETRO_DEVICE_ID_MOUSE_WHEELUP)) {
-		wheel_accum++;
+		wheel++;
 	}
 	if (cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
 			   RETRO_DEVICE_ID_MOUSE_WHEELDOWN)) {
-		wheel_accum--;
+		wheel--;
+	}
+
+	bool key_down_now[RETROK_LAST];
+	for (unsigned k = 1; k < RETROK_LAST; k++) {
+		if (key_map[k]) {
+			key_down_now[k] = cb_input_state(
+				0, RETRO_DEVICE_KEYBOARD, 0, k);
+		}
+	}
+
+	pthread_mutex_lock(&input_mutex);
+	// Deltas accumulate: the emu thread consumes them at its own rate.
+	mouse_dx += dx;
+	mouse_dy += dy;
+	memcpy(buttons_down, btn, sizeof(buttons_down));
+	wheel_accum += wheel;
+
+	// Emit key transitions in three passes — modifier presses first,
+	// then everything else, then modifier releases — so a shift+letter
+	// combination first seen in the same poll reaches the guest in an
+	// order that produces the shifted character.
+	for (int pass = 0; pass < 3; pass++) {
+		for (unsigned k = 1; k < RETROK_LAST; k++) {
+			if (!key_map[k] || key_down_now[k] == key_down_prev[k]) {
+				continue;
+			}
+			bool mod = key_is_modifier(k);
+			if ((pass == 0 && !(mod && key_down_now[k])) ||
+			    (pass == 1 && mod) ||
+			    (pass == 2 && !(mod && !key_down_now[k]))) {
+				continue;
+			}
+			enqueue_key_locked(key_down_now[k], key_map[k]);
+			key_down_prev[k] = key_down_now[k];
+		}
 	}
 	pthread_mutex_unlock(&input_mutex);
 
@@ -1177,18 +1287,26 @@ void retro_run(void)
 		return;
 	}
 
-	// Snapshot av_info and deliver geometry changes outside av_info_lock:
-	// SET_SYSTEM_AV_INFO can re-init the frontend's video driver, and
+	// Snapshot av_info and deliver changes outside av_info_lock:
+	// SET_SYSTEM_AV_INFO can re-init the frontend's drivers, and
 	// publishers must stay free to update av_info meanwhile.
 	struct retro_system_av_info av_local;
-	bool av_changed;
+	bool geom_changed, timing_changed;
 	pthread_mutex_lock(&av_info_lock);
-	av_changed = changed_av_info;
-	changed_av_info = false;
+	geom_changed = changed_geometry;
+	timing_changed = changed_timing;
+	changed_geometry = false;
+	changed_timing = false;
 	av_local = av_info;
 	pthread_mutex_unlock(&av_info_lock);
-	if (av_changed) {
+	if (timing_changed) {
+		// Full driver reinit on RetroArch 1.7.5 — acceptable only
+		// because a sample-rate change happens at most once, when
+		// the guest's audio driver first opens the voice at a
+		// non-default rate (see av_info comment).
 		cb_env(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_local);
+	} else if (geom_changed) {
+		cb_env(RETRO_ENVIRONMENT_SET_GEOMETRY, &av_local.geometry);
 	}
 
 	// Present the latest frame QEMU published; NULL means "same frame as
