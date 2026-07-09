@@ -416,17 +416,36 @@ static pthread_mutex_t av_info_lock = PTHREAD_MUTEX_INITIALIZER;
 // grab (the recreated dinput device loses its hotkey-block flags, so
 // guest typing suddenly triggers frontend hotkeys) and restarts the audio
 // thread. Guests switch video modes several times per boot, so geometry
-// must never take the SET_SYSTEM_AV_INFO path.
+// avoids the SET_SYSTEM_AV_INFO path — with one exception: 1.7.5-era
+// frontends size their video texture from the geometry in effect at the
+// last (re)init and SET_GEOMETRY never grows it, so a mode LARGER than
+// anything delivered before would have its right/bottom edge clipped
+// (observed in EmuVR: 1280-wide modes lost the right 256 px). The first
+// time a dimension exceeds the session's delivered envelope the change is
+// promoted to SET_SYSTEM_AV_INFO so the frontend reallocates; every
+// switch inside the envelope still rides SET_GEOMETRY.
 static bool changed_geometry = false;
 static bool changed_timing = false;
+// Largest geometry delivered to the frontend so far (the envelope its
+// texture is known to accommodate). Frontend-thread-only: retro_run and
+// retro_load_game.
+static unsigned delivered_env_w;
+static unsigned delivered_env_h;
 static struct retro_system_av_info av_info = {
 	.geometry = {
 		// base_* track the guest mode; max_* are a fixed ceiling no
 		// supported guest mode exceeds (Cirrus/std VGA top out at
 		// 1600x1200), because raising max_* would need exactly the
 		// SET_SYSTEM_AV_INFO reinit described above.
-		.base_width = 640,
-		.base_height = 480,
+		//
+		// The initial base is deliberately 1024x768 rather than the
+		// 640x480 the guest actually boots in: frontends size their
+		// texture from this, smaller modes render fine as a
+		// sub-rectangle, and it makes the whole boot-to-desktop mode
+		// dance of a 1024x768 guest fit the envelope with zero
+		// promoted reinits.
+		.base_width = 1024,
+		.base_height = 768,
 		.max_width = 1920,
 		.max_height = 1200,
 		.aspect_ratio = 0.0,
@@ -1489,6 +1508,13 @@ bool retro_load_game(const struct retro_game_info *game)
 	// thread-creation happens-before lets emu_thread_fn read the opt_*
 	// statics without locking.
 	update_variables(true);
+	// The frontend sized its texture from retro_get_system_av_info, so
+	// the delivered envelope starts at whatever base that reported
+	// (av_info persists across load cycles).
+	pthread_mutex_lock(&av_info_lock);
+	delivered_env_w = av_info.geometry.base_width;
+	delivered_env_h = av_info.geometry.base_height;
+	pthread_mutex_unlock(&av_info_lock);
 	if (pthread_create(&emu_thread, NULL, emu_thread_fn, NULL) != 0) {
 		return false;
 	}
@@ -1698,12 +1724,24 @@ void retro_run(void)
 	changed_timing = false;
 	av_local = av_info;
 	pthread_mutex_unlock(&av_info_lock);
-	if (timing_changed) {
+	bool env_grows = av_local.geometry.base_width > delivered_env_w ||
+			 av_local.geometry.base_height > delivered_env_h;
+	if (timing_changed || (geom_changed && env_grows)) {
 		// Full driver reinit on RetroArch 1.7.5 — acceptable only
-		// because a sample-rate change happens at most once, when
-		// the guest's audio driver first opens the voice at a
-		// non-default rate (see av_info comment).
+		// on the rare paths that need it: a sample-rate change
+		// (at most once, when the guest's audio driver first opens
+		// the voice at a non-default rate) or a mode that outgrew
+		// everything delivered this session, where the frontend's
+		// texture may be too small and SET_GEOMETRY wouldn't grow
+		// it (see av_info comment).
 		cb_env(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_local);
+		// The reinit re-sizes the frontend's texture from the
+		// geometry delivered with it, so the envelope resets to
+		// that geometry rather than accumulating a sticky maximum
+		// (a frontend sizing exactly from base would otherwise be
+		// credited with room it no longer has).
+		delivered_env_w = av_local.geometry.base_width;
+		delivered_env_h = av_local.geometry.base_height;
 	} else if (geom_changed) {
 		cb_env(RETRO_ENVIRONMENT_SET_GEOMETRY, &av_local.geometry);
 	}
