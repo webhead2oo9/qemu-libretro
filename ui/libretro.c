@@ -137,7 +137,7 @@ static unsigned restart_notified_mask; // frontend thread only
 // retro_load_game because statics persist across load cycles.
 static GPtrArray *disc_list; // char *, absolute paths; owns entries
 static unsigned disc_index; // selected disc (== inserted when tray shut)
-static bool tray_ejected; // virtual tray the frontend toggles
+static bool tray_ejected; // tray state requested by the frontend
 static bool disc_change_pending; // selection changed while tray open
 // Boot descriptor. Written by retro_load_game before the emu thread is
 // created (happens-before, no locks) and selects the argv branch in
@@ -145,16 +145,22 @@ static bool disc_change_pending; // selection changed while tray open
 // medium for -cdrom; both NULL boots game_path as a bare disk image.
 static char *boot_cmd_line_path;
 static char *boot_cdrom_path;
-// Medium change awaiting disk_swap_bh; a newer request overwrites an
-// unconsumed one, so rapid swaps coalesce to the final selection.
+// Tray/medium operation awaiting disk_swap_bh; a newer request overwrites
+// an unconsumed one, so rapid operations coalesce to the final state.
+enum disk_request_type {
+	DISK_REQ_NONE,
+	DISK_REQ_OPEN,
+	DISK_REQ_CLOSE,
+	DISK_REQ_CHANGE,
+	DISK_REQ_EJECT_CLOSE,
+};
 static struct {
-	bool valid;
-	bool eject; // remove the medium without inserting another
-	char *filename; // owned; medium to insert when !eject
+	enum disk_request_type type;
+	char *filename; // owned; medium to insert for DISK_REQ_CHANGE
 } disk_req;
 static pthread_mutex_t disk_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Swap bottom half; created on the emu thread once the console exists
-// (display_init), scheduled by disk_commit (legal from any thread).
+// (display_init), scheduled by disk_request (legal from any thread).
 static QEMUBH *disk_bh;
 static void disk_swap_bh(void *opaque);
 // These predicates live in internal block-layer headers (block_int-*.h)
@@ -1543,9 +1549,9 @@ static bool scan_cmd_line_cdrom(const char *cmd_line_path)
 	}
 	for (char **p = argv; *p; p++) {
 		if (!strcmp(*p, "-cdrom") && p[1]) {
-			// Relative media resolve against the game dir:
+			// Relative media resolve against the command-file dir:
 			// that's QEMU's cwd once emu_thread_fn chdirs.
-			char *dir = g_path_get_dirname(game_path);
+			char *dir = g_path_get_dirname(cmd_line_path);
 			char *abs = g_path_is_absolute(p[1]) ?
 					    g_canonicalize_filename(p[1], NULL) :
 					    g_canonicalize_filename(p[1], dir);
@@ -1560,24 +1566,13 @@ static bool scan_cmd_line_cdrom(const char *cmd_line_path)
 	return found;
 }
 
-// Hand the current selection to disk_swap_bh. Frontend thread.
-static void disk_commit(void)
+// Hand a tray/medium operation to disk_swap_bh. Frontend thread.
+static void disk_request(enum disk_request_type type, const char *filename)
 {
 	pthread_mutex_lock(&disk_mutex);
 	g_free(disk_req.filename);
-	if (disc_index < disc_list->len &&
-	    ((const char *)disc_list->pdata[disc_index])[0]) {
-		disk_req.eject = false;
-		disk_req.filename = g_strdup(disc_list->pdata[disc_index]);
-	} else {
-		// Past the end (frontend removed the disc without
-		// inserting another — RetroArch 1.7.5 clamps and never
-		// sends it) or an append placeholder that never received
-		// its image: leave the drive empty.
-		disk_req.eject = true;
-		disk_req.filename = NULL;
-	}
-	disk_req.valid = true;
+	disk_req.type = type;
+	disk_req.filename = g_strdup(filename);
 	pthread_mutex_unlock(&disk_mutex);
 	// disk_bh is only created once QEMU is up (display_init), so a
 	// non-NULL pointer means the main loop exists to run it.
@@ -1586,18 +1581,32 @@ static void disk_commit(void)
 	}
 }
 
-// Apply a pending medium change. Runs as a bottom half on the main loop
+// Close the tray with the current selection. Frontend thread.
+static void disk_commit(void)
+{
+	if (disc_index < disc_list->len &&
+	    ((const char *)disc_list->pdata[disc_index])[0]) {
+		disk_request(DISK_REQ_CHANGE, disc_list->pdata[disc_index]);
+	} else {
+		// Past the end (frontend removed the disc without
+		// inserting another — RetroArch 1.7.5 clamps and never
+		// sends it) or an append placeholder that never received its
+		// image: remove the medium and close the empty tray.
+		disk_request(DISK_REQ_EJECT_CLOSE, NULL);
+	}
+}
+
+// Apply a pending tray/medium operation. Runs as a bottom half on the main loop
 // thread under the BQL — the context the qmp_* handlers require.
 static void disk_swap_bh(void *opaque)
 {
 	pthread_mutex_lock(&disk_mutex);
-	bool valid = disk_req.valid;
-	bool eject = disk_req.eject;
+	enum disk_request_type type = disk_req.type;
 	char *filename = disk_req.filename;
-	disk_req.valid = false;
+	disk_req.type = DISK_REQ_NONE;
 	disk_req.filename = NULL;
 	pthread_mutex_unlock(&disk_mutex);
-	if (!valid) {
+	if (type == DISK_REQ_NONE) {
 		return; // an earlier dispatch already applied the request
 	}
 
@@ -1618,19 +1627,33 @@ static void disk_swap_bh(void *opaque)
 		return;
 	}
 
-	// force=true: Windows guests lock the tray (PREVENT MEDIUM
-	// REMOVAL) while a disc is mounted, which would fail the swap
-	// exactly when an installer asks for the next disc. The change
-	// path raises the ATAPI "medium may have changed" sequence, so
-	// the guest re-reads the new disc.
+	// force=true: Windows guests lock the tray (PREVENT MEDIUM REMOVAL)
+	// while a disc is mounted, which would fail exactly when an installer
+	// asks for the next disc. The change path raises the ATAPI "medium may
+	// have changed" sequence, so the guest re-reads the new disc.
 	const char *dev = CALL_QEMU_FUNC(blk_name, blk);
 	Error *err = NULL;
-	if (eject) {
-		CALL_QEMU_FUNC(qmp_eject, dev, NULL, true, true, &err);
-	} else {
+	switch (type) {
+	case DISK_REQ_OPEN:
+		CALL_QEMU_FUNC(qmp_blockdev_open_tray, dev, NULL,
+			       true, true, &err);
+		break;
+	case DISK_REQ_CLOSE:
+		CALL_QEMU_FUNC(qmp_blockdev_close_tray, dev, NULL, &err);
+		break;
+	case DISK_REQ_CHANGE:
 		CALL_QEMU_FUNC(qmp_blockdev_change_medium, dev, NULL,
 			       filename, NULL, true, true, false,
 			       BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN, &err);
+		break;
+	case DISK_REQ_EJECT_CLOSE:
+		CALL_QEMU_FUNC(qmp_eject, dev, NULL, true, true, &err);
+		if (!err) {
+			CALL_QEMU_FUNC(qmp_blockdev_close_tray, dev, NULL, &err);
+		}
+		break;
+	case DISK_REQ_NONE:
+		g_assert_not_reached();
 	}
 	if (err) {
 		notice_report("disc swap failed: %s",
@@ -1640,10 +1663,9 @@ static void disk_swap_bh(void *opaque)
 	g_free(filename);
 }
 
-// The libretro v0 disk-control callbacks (frontend thread). The tray is
-// core-side state: QEMU is only touched when the tray closes on a
-// changed selection, as one atomic medium change — opening and closing
-// the tray without moving the index never disturbs the guest.
+// The libretro v0 disk-control callbacks (frontend thread). Every state
+// transition is forwarded to QEMU so the state reported to the frontend
+// agrees with the guest-visible tray.
 static bool disk_set_eject_state(bool ejected)
 {
 	if (ejected == tray_ejected) {
@@ -1652,9 +1674,12 @@ static bool disk_set_eject_state(bool ejected)
 	tray_ejected = ejected;
 	if (ejected) {
 		disc_change_pending = false;
+		disk_request(DISK_REQ_OPEN, NULL);
 	} else if (disc_change_pending) {
 		disc_change_pending = false;
 		disk_commit();
+	} else {
+		disk_request(DISK_REQ_CLOSE, NULL);
 	}
 	return true;
 }
@@ -1752,9 +1777,11 @@ static const struct retro_disk_control_callback disk_control_cb = {
 
 static void *emu_thread_fn(void *arg)
 {
-	char *game_dir = g_path_get_dirname(game_path);
-	g_chdir(game_dir);
-	g_free(game_dir);
+	const char *working_path = boot_cmd_line_path ? boot_cmd_line_path :
+						 game_path;
+	char *working_dir = g_path_get_dirname(working_path);
+	g_chdir(working_dir);
+	g_free(working_dir);
 
 	// All content branches build argv here so core-option overrides
 	// apply uniformly. Intentionally leaked: start_qemu_with_args blocks
@@ -1837,8 +1864,7 @@ bool retro_load_game(const struct retro_game_info *game)
 	pthread_mutex_lock(&disk_mutex);
 	g_free(disk_req.filename);
 	disk_req.filename = NULL;
-	disk_req.valid = false;
-	disk_req.eject = false;
+	disk_req.type = DISK_REQ_NONE;
 	pthread_mutex_unlock(&disk_mutex);
 	if (disc_list) {
 		g_ptr_array_set_size(disc_list, 0);
