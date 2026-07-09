@@ -57,21 +57,64 @@ static int mouse_dx, mouse_dy;
 static bool buttons_down[INPUT_BUTTON__MAX];
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Video. QEMU runs free; the emu thread copies each finished frame here and
-// retro_run presents the latest one. This replaces an older design that ran
-// the two threads in lockstep, which throttled the guest to the frontend's
-// frame rate and stalled I/O handling (the emu thread used to park holding
-// the BQL between frames).
+// Video. QEMU runs free; publishers — refresh() on the emu thread and the
+// qemu-3dfx readback glue on a vCPU thread, both under the BQL — copy each
+// finished frame into the pending slot, and retro_run swaps the slots and
+// presents outside frame_mutex. Two slots so the handoff is a pointer
+// exchange: a publisher must never wait on the frontend's upload/vsync,
+// which stalls the BQL and with it the emu thread's 10 ms audio timer
+// (audible crackle). This replaces an older design that ran the two
+// threads in lockstep, which throttled the guest to the frontend's frame
+// rate and stalled I/O handling (the emu thread used to park holding the
+// BQL between frames).
+struct frame_slot {
+	uint8_t *buf;
+	int w, h;
+};
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t *frame_buf;
-static int frame_w, frame_h;
-static bool frame_valid = false;   // a frame has been copied at least once
-static bool frame_updated = false; // new content since the last present
+static struct frame_slot pending_frame; // under frame_mutex
+static struct frame_slot present_frame; // frontend thread only
+static bool pending_updated = false;	// under frame_mutex
+static bool present_valid = false;	// frontend thread only
 // While qemu-3dfx pass-through presents (Win98 Glide/GL games), frames
 // come from the readback glue instead of the VGA surface; refresh()
 // stands down so the stale surface cannot overwrite them. Written and
 // read under the BQL only.
 static bool fx_active;
+
+// Size the pending slot for a w-by-h XRGB8888 frame; frame_mutex held.
+// Buffers are only ever reallocated, never freed: the present slot may
+// still be feeding the frontend when the machine shuts down.
+static void pending_ensure(int w, int h)
+{
+	if (!pending_frame.buf || pending_frame.w != w ||
+	    pending_frame.h != h) {
+		pending_frame.buf =
+			g_realloc(pending_frame.buf, (size_t)w * h * 4);
+		pending_frame.w = w;
+		pending_frame.h = h;
+	}
+}
+
+// Swap in the newest published frame, if any; frontend thread only.
+// Returns true when present_frame now holds fresh content.
+static bool frame_acquire(void)
+{
+	bool fresh = false;
+
+	pthread_mutex_lock(&frame_mutex);
+	if (pending_updated) {
+		struct frame_slot tmp = pending_frame;
+		pending_frame = present_frame;
+		present_frame = tmp;
+		pending_updated = false;
+		present_valid = true;
+		fresh = true;
+	}
+	pthread_mutex_unlock(&frame_mutex);
+
+	return fresh;
+}
 
 // Notifications. QEMU reports errors from arbitrary threads, but libretro
 // environment calls are only safe from the frontend thread, so messages
@@ -586,21 +629,16 @@ static void refresh(DisplayChangeListener *dcl)
 		uint8_t *src = surface_data(surface);
 
 		pthread_mutex_lock(&frame_mutex);
-		if (!frame_buf || frame_w != w || frame_h != h) {
-			frame_buf = g_realloc(frame_buf, (size_t)w * h * 4);
-			frame_w = w;
-			frame_h = h;
-		}
+		pending_ensure(w, h);
 		if (stride == w * 4) {
-			memcpy(frame_buf, src, (size_t)w * h * 4);
+			memcpy(pending_frame.buf, src, (size_t)w * h * 4);
 		} else {
 			for (int y = 0; y < h; y++) {
-				memcpy(frame_buf + (size_t)y * w * 4,
+				memcpy(pending_frame.buf + (size_t)y * w * 4,
 				       src + (size_t)y * stride, w * 4);
 			}
 		}
-		frame_valid = true;
-		frame_updated = true;
+		pending_updated = true;
 		pthread_mutex_unlock(&frame_mutex);
 	}
 
@@ -637,17 +675,12 @@ static void fx_sink_publish(const void *pixels, int w, int h)
 	const uint8_t *src = pixels;
 
 	pthread_mutex_lock(&frame_mutex);
-	if (!frame_buf || frame_w != w || frame_h != h) {
-		frame_buf = g_realloc(frame_buf, (size_t)w * h * 4);
-		frame_w = w;
-		frame_h = h;
-	}
+	pending_ensure(w, h);
 	for (int y = 0; y < h; y++) {
-		memcpy(frame_buf + (size_t)y * w * 4,
+		memcpy(pending_frame.buf + (size_t)y * w * 4,
 		       src + (size_t)(h - 1 - y) * w * 4, (size_t)w * 4);
 	}
-	frame_valid = true;
-	frame_updated = true;
+	pending_updated = true;
 	pthread_mutex_unlock(&frame_mutex);
 
 	pthread_mutex_lock(&av_info_lock);
@@ -1035,27 +1068,36 @@ void retro_run(void)
 		return;
 	}
 
+	// Snapshot av_info and deliver geometry changes outside av_info_lock:
+	// SET_SYSTEM_AV_INFO can re-init the frontend's video driver, and
+	// publishers must stay free to update av_info meanwhile.
+	struct retro_system_av_info av_local;
+	bool av_changed;
 	pthread_mutex_lock(&av_info_lock);
-	if (changed_av_info) {
-		changed_av_info = false;
-		cb_env(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
-	}
+	av_changed = changed_av_info;
+	changed_av_info = false;
+	av_local = av_info;
 	pthread_mutex_unlock(&av_info_lock);
+	if (av_changed) {
+		cb_env(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_local);
+	}
 
 	// Present the latest frame QEMU published; NULL means "same frame as
-	// last time" and lets the frontend skip the upload.
-	pthread_mutex_lock(&frame_mutex);
-	if (frame_valid) {
-		cb_video_refresh(frame_updated ? frame_buf : NULL,
-				 frame_w, frame_h, (size_t)frame_w * 4);
-		frame_updated = false;
+	// last time" and lets the frontend skip the upload. present_frame is
+	// owned by this thread, so no lock is held across cb_video_refresh —
+	// publishers run under the BQL and must never wait on the frontend's
+	// upload/vsync.
+	bool fresh = frame_acquire();
+	if (present_valid) {
+		cb_video_refresh(fresh ? present_frame.buf : NULL,
+				 present_frame.w, present_frame.h,
+				 (size_t)present_frame.w * 4);
 	} else {
 		// Nothing rendered yet (or the config has no libretro
 		// display); present a duped blank frame at the advertised
 		// geometry instead of blocking.
-		cb_video_refresh(NULL, av_info.geometry.base_width,
-				 av_info.geometry.base_height,
-				 (size_t)av_info.geometry.base_width * 4);
+		cb_video_refresh(NULL, av_local.geometry.base_width,
+				 av_local.geometry.base_height,
+				 (size_t)av_local.geometry.base_width * 4);
 	}
-	pthread_mutex_unlock(&frame_mutex);
 }
