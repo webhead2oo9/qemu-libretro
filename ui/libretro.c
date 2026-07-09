@@ -43,9 +43,10 @@ static HWVoiceOut *hw_voice_out = NULL;
 static pthread_mutex_t hw_voice_out_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Input. Written by the frontend thread (retro_run / keyboard callback),
-// consumed by the emu thread (refresh); the two run concurrently, so all
-// access goes through input_mutex. Mouse deltas accumulate because the two
-// sides tick at independent rates.
+// consumed on the main loop thread by input_inject_bh; the two run
+// concurrently, so all access goes through input_mutex. Mouse deltas and
+// wheel detents accumulate because the two sides tick at independent
+// rates.
 #define KEY_EVENT_QUEUE_LEN 64
 struct key_event {
 	bool down;
@@ -54,8 +55,12 @@ struct key_event {
 static struct key_event key_event_queue[KEY_EVENT_QUEUE_LEN];
 static size_t num_pending_keys = 0;
 static int mouse_dx, mouse_dy;
+static int wheel_accum; // scroll detents, up positive
 static bool buttons_down[INPUT_BUTTON__MAX];
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Injection bottom half; created on the emu thread once the console
+// exists, scheduled by retro_run after each poll (legal from any thread).
+static QEMUBH *input_bh;
 
 // Video. QEMU runs free; publishers — refresh() on the emu thread and the
 // qemu-3dfx readback glue on a vCPU thread, both under the BQL — copy each
@@ -641,29 +646,6 @@ static void refresh(DisplayChangeListener *dcl)
 		pending_updated = true;
 		pthread_mutex_unlock(&frame_mutex);
 	}
-
-	// Inject input collected by the frontend since the last refresh.
-	pthread_mutex_lock(&input_mutex);
-
-	for (size_t i = 0; i < num_pending_keys; i++) {
-		CALL_QEMU_FUNC(qkbd_state_key_event, kbd,
-			       key_event_queue[i].key, key_event_queue[i].down);
-	}
-	num_pending_keys = 0;
-
-	CALL_QEMU_FUNC(qemu_input_queue_rel, dcl->con, INPUT_AXIS_X, mouse_dx);
-	CALL_QEMU_FUNC(qemu_input_queue_rel, dcl->con, INPUT_AXIS_Y, mouse_dy);
-	mouse_dx = 0;
-	mouse_dy = 0;
-
-	for (size_t i = 0; i < INPUT_BUTTON__MAX; i++) {
-		CALL_QEMU_FUNC(qemu_input_queue_btn, dcl->con, i,
-			       buttons_down[i]);
-	}
-
-	pthread_mutex_unlock(&input_mutex);
-
-	CALL_QEMU_FUNC(qemu_input_event_sync);
 }
 
 #ifdef CONFIG_QEMU_3DFX
@@ -750,10 +732,91 @@ static DisplayChangeListener dcl = {
 	} },
 };
 
+// Inject the input collected by the frontend into the guest. Runs as a
+// bottom half on the main loop thread under the BQL; retro_run schedules
+// it after each poll, so injection waits one BH dispatch instead of up to
+// a display refresh period. Events are sent on real changes only: the
+// PS/2 mouse emits a packet (and an IRQ12, waking an idle guest) on every
+// sync while enabled, and counts wheel motion again on each repeated
+// wheel-button down event.
+static void input_inject_bh(void *opaque)
+{
+	// Level state already sent to the guest; this thread only. Wheel
+	// buttons have no map entry — the PS/2 model treats a wheel down
+	// event as one detent, so they are pulsed from wheel_accum below
+	// instead of tracked as level state.
+	static uint32_t buttons_old;
+	static uint32_t btn_map[INPUT_BUTTON__MAX] = {
+		[INPUT_BUTTON_LEFT] = 1u << INPUT_BUTTON_LEFT,
+		[INPUT_BUTTON_RIGHT] = 1u << INPUT_BUTTON_RIGHT,
+		[INPUT_BUTTON_MIDDLE] = 1u << INPUT_BUTTON_MIDDLE,
+	};
+	struct key_event keys[KEY_EVENT_QUEUE_LEN];
+	size_t nkeys;
+	uint32_t buttons_new = 0;
+	int dx, dy, wheel;
+
+	pthread_mutex_lock(&input_mutex);
+	nkeys = num_pending_keys;
+	memcpy(keys, key_event_queue, nkeys * sizeof(keys[0]));
+	num_pending_keys = 0;
+	dx = mouse_dx;
+	dy = mouse_dy;
+	mouse_dx = 0;
+	mouse_dy = 0;
+	wheel = wheel_accum;
+	wheel_accum = 0;
+	for (size_t i = 0; i < INPUT_BUTTON__MAX; i++) {
+		if (buttons_down[i]) {
+			buttons_new |= 1u << i;
+		}
+	}
+	pthread_mutex_unlock(&input_mutex);
+
+	bool changed = nkeys || dx || dy || wheel || buttons_new != buttons_old;
+
+	for (size_t i = 0; i < nkeys; i++) {
+		CALL_QEMU_FUNC(qkbd_state_key_event, kbd, keys[i].key,
+			       keys[i].down);
+	}
+
+	if (dx) {
+		CALL_QEMU_FUNC(qemu_input_queue_rel, dcl.con, INPUT_AXIS_X, dx);
+	}
+	if (dy) {
+		CALL_QEMU_FUNC(qemu_input_queue_rel, dcl.con, INPUT_AXIS_Y, dy);
+	}
+
+	CALL_QEMU_FUNC(qemu_input_update_buttons, dcl.con, btn_map,
+		       buttons_old, buttons_new);
+	buttons_old = buttons_new;
+
+	// One down-then-up pulse per detent; the PS/2 model counts wheel
+	// motion on down events and ignores ups.
+	for (; wheel > 0; wheel--) {
+		CALL_QEMU_FUNC(qemu_input_queue_btn, dcl.con,
+			       INPUT_BUTTON_WHEEL_UP, true);
+		CALL_QEMU_FUNC(qemu_input_queue_btn, dcl.con,
+			       INPUT_BUTTON_WHEEL_UP, false);
+	}
+	for (; wheel < 0; wheel++) {
+		CALL_QEMU_FUNC(qemu_input_queue_btn, dcl.con,
+			       INPUT_BUTTON_WHEEL_DOWN, true);
+		CALL_QEMU_FUNC(qemu_input_queue_btn, dcl.con,
+			       INPUT_BUTTON_WHEEL_DOWN, false);
+	}
+
+	if (changed) {
+		CALL_QEMU_FUNC(qemu_input_event_sync);
+	}
+}
+
 static void display_init(DisplayState *ds, DisplayOptions *o)
 {
 	dcl.con = CALL_QEMU_FUNC(qemu_console_lookup_by_index, 0);
 	kbd = CALL_QEMU_FUNC(qkbd_state_init, dcl.con);
+	input_bh = CALL_QEMU_FUNC(qemu_bh_new_full, input_inject_bh, NULL,
+				  "libretro-input", NULL);
 	CALL_QEMU_FUNC(register_displaychangelistener, &dcl);
 #ifdef CONFIG_QEMU_3DFX
 	CALL_QEMU_FUNC(qemu_fx_register_sink, &fx_sink);
@@ -1055,10 +1118,24 @@ void retro_run(void)
 	BTN(LEFT, LEFT);
 	BTN(RIGHT, RIGHT);
 	BTN(MIDDLE, MIDDLE);
-	BTN(WHEEL_UP, WHEELUP);
-	BTN(WHEEL_DOWN, WHEELDOWN);
 #undef BTN
+	// The frontend reports wheel motion as a momentary button; count
+	// detents so none are lost or repeated across injection ticks.
+	if (cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
+			   RETRO_DEVICE_ID_MOUSE_WHEELUP)) {
+		wheel_accum++;
+	}
+	if (cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
+			   RETRO_DEVICE_ID_MOUSE_WHEELDOWN)) {
+		wheel_accum--;
+	}
 	pthread_mutex_unlock(&input_mutex);
+
+	// input_bh is only created once QEMU is up (display_init), so a
+	// non-NULL pointer means the main loop exists to run it.
+	if (input_bh && !exited) {
+		CALL_QEMU_FUNC(qemu_bh_schedule, input_bh);
+	}
 
 	flush_pending_messages();
 
