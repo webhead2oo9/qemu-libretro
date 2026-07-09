@@ -87,9 +87,13 @@ case "$platform" in
             win64)
                 # WHPX: hardware virtualization on Windows hosts; the core
                 # falls back to TCG at runtime when it isn't available.
+                # qemu-3dfx: Glide/OpenGL pass-through devices (3D games
+                # render on the host GPU); inert unless the guest runs
+                # the qemu-3dfx wrappers.
                 EXTRA_CONFIGURE_ARGS=(
                     "--cross-prefix=x86_64-w64-mingw32.static-"
                     "--enable-whpx"
+                    "--enable-qemu-3dfx"
                 )
                 ;;
         esac
