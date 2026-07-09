@@ -413,10 +413,13 @@ static unsigned __stdcall win32_start_routine(void *arg)
     abort();
 }
 
+static void qemu_thread_queue_remove_self(void);
+
 void qemu_thread_exit(void *arg)
 {
     QemuThreadData *data = qemu_thread_data;
 
+    qemu_thread_queue_remove_self();
     notifier_list_notify(&data->exit, NULL);
     if (data->mode == QEMU_THREAD_JOINABLE) {
         data->ret = arg;
@@ -477,36 +480,94 @@ static bool set_thread_description(HANDLE h, const char *name)
     return SUCCEEDED(hr);
 }
 
-/* Store list of all threads so they can all be stopped later */
+/*
+ * Track live threads so any still running at teardown can be stopped.
+ * Entries hold a real handle taken at creation time (so a recycled TID
+ * can never name the wrong thread) and are removed by the exiting
+ * thread itself in qemu_thread_exit — the queue therefore only ever
+ * names live threads, unlike the previous design, which kept stale
+ * entries with dangling ->data forever and made qemu_thread_kill_all
+ * abandon the walk at the first thread that had already exited.
+ */
+typedef struct QemuThreadEntry {
+    DWORD tid;
+    HANDLE handle;
+} QemuThreadEntry;
+
 static GQueue *qemu_thread_queue;
+static GMutex qemu_thread_queue_lock;
+
+static void qemu_thread_queue_add(DWORD tid, HANDLE handle)
+{
+    QemuThreadEntry *e = g_new(QemuThreadEntry, 1);
+
+    e->tid = tid;
+    e->handle = handle;
+    g_mutex_lock(&qemu_thread_queue_lock);
+    if (!qemu_thread_queue) {
+        qemu_thread_queue = g_queue_new();
+    }
+    g_queue_push_tail(qemu_thread_queue, e);
+    g_mutex_unlock(&qemu_thread_queue_lock);
+}
+
+static void qemu_thread_queue_remove_self(void)
+{
+    DWORD tid = GetCurrentThreadId();
+    QemuThreadEntry *e = NULL;
+    GList *l;
+
+    g_mutex_lock(&qemu_thread_queue_lock);
+    if (qemu_thread_queue) {
+        for (l = qemu_thread_queue->head; l; l = l->next) {
+            if (((QemuThreadEntry *)l->data)->tid == tid) {
+                e = l->data;
+                g_queue_delete_link(qemu_thread_queue, l);
+                break;
+            }
+        }
+    }
+    g_mutex_unlock(&qemu_thread_queue_lock);
+
+    if (e) {
+        CloseHandle(e->handle);
+        g_free(e);
+    }
+}
 
 /* Stop all remaining threads */
 void qemu_thread_kill_all(void)
 {
-    QemuThread *thread;
-    HANDLE hThread;
-
-    if (!qemu_thread_queue) {
-        return;
-    }
-
+    /*
+     * Post-cleanup use only (see ui/libretro.c): QEMU's own shutdown
+     * already ran, so whatever is still alive stays alive by design
+     * (RCU threads, idling thread-pool workers) and would fault inside
+     * unmapped code once the host unloads the DLL. Terminate AND wait:
+     * TerminateThread alone is asynchronous, and returning before the
+     * victims are gone re-opens the unload race this exists to close.
+     */
     for (;;) {
-        thread = g_queue_pop_head(qemu_thread_queue);
-        if (!thread) {
-            break;
-        }
-        hThread = qemu_thread_get_handle(thread);
-        if (!hThread) {
-            break;
-        }
-        TerminateThread(hThread, 0);
-        CloseHandle(hThread);
-        qemu_thread_join(thread);
-        g_free(thread);
-    }
+        QemuThreadEntry *e;
 
-    g_queue_free(qemu_thread_queue);
-    qemu_thread_queue = NULL;
+        g_mutex_lock(&qemu_thread_queue_lock);
+        e = qemu_thread_queue ? g_queue_pop_head(qemu_thread_queue) : NULL;
+        g_mutex_unlock(&qemu_thread_queue_lock);
+        if (!e) {
+            break;
+        }
+
+        if (e->tid != GetCurrentThreadId()) {
+            /* Fails harmlessly if the thread exited since the pop. */
+            TerminateThread(e->handle, 0);
+            /*
+             * Bounded: a thread wedged in a kernel wait a debugger
+             * suspended must not hang teardown forever.
+             */
+            WaitForSingleObject(e->handle, 2000);
+        }
+        CloseHandle(e->handle);
+        g_free(e);
+    }
 }
 
 void qemu_thread_create(QemuThread *thread, const char *name,
@@ -515,7 +576,6 @@ void qemu_thread_create(QemuThread *thread, const char *name,
 {
     HANDLE hThread;
     struct QemuThreadData *data;
-    QemuThread *thread_copy;
 
     data = g_malloc(sizeof *data);
     data->start_routine = start_routine;
@@ -536,16 +596,11 @@ void qemu_thread_create(QemuThread *thread, const char *name,
     if (name_threads && name && !set_thread_description(hThread, name)) {
         fprintf(stderr, "qemu: failed to set thread description: %s\n", name);
     }
-    CloseHandle(hThread);
 
     thread->data = data;
 
-    if (!qemu_thread_queue) {
-        qemu_thread_queue = g_queue_new();
-    }
-    thread_copy = g_new(QemuThread, 1);
-    *thread_copy = *thread;
-    g_queue_push_tail(qemu_thread_queue, thread_copy);
+    /* The tracker owns the _beginthreadex handle from here on. */
+    qemu_thread_queue_add(thread->tid, hThread);
 }
 
 int qemu_thread_set_affinity(QemuThread *thread, unsigned long *host_cpus,
