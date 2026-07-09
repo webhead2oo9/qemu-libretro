@@ -502,6 +502,8 @@ static void audio_fini(void *opaque)
 static int audio_init_out(HWVoiceOut *hw, struct audsettings *as,
 			  void *drv_opaque)
 {
+	Audiodev *dev = drv_opaque;
+
 	// The frontend consumes S16 stereo only; fail the voice rather than
 	// abort the process on other configurations.
 	if (as->fmt != AUDIO_FORMAT_S16 || as->nchannels != 2) {
@@ -515,7 +517,13 @@ static int audio_init_out(HWVoiceOut *hw, struct audsettings *as,
 
 	CALL_QEMU_FUNC(audio_pcm_init_info, &hw->info, as);
 
-	hw->samples = 1024;
+	// Ring size: -audiodev libretro,out.buffer-length=USECS, default
+	// ~23 ms (the old hardcoded 1024 frames at 44.1 kHz). This is the
+	// only underrun headroom there is — samples are produced by the emu
+	// thread's 10 ms audio timer under the BQL and drained at the
+	// frontend's audio callback cadence.
+	hw->samples = CALL_QEMU_FUNC(audio_buffer_frames,
+				     dev->u.libretro.out, as, 23220);
 
 	pthread_mutex_lock(&hw_voice_out_mutex);
 	g_assert(!hw_voice_out);
@@ -612,22 +620,23 @@ static bool gfx_check_format(DisplayChangeListener *dcl,
 
 static void refresh(DisplayChangeListener *dcl)
 {
-	// Re-render the guest display at ~30 Hz but keep input injection at
-	// the full tick rate: with WHPX the VGA code re-converts the whole
-	// surface on every update (no dirty VRAM tracking), and doing that
-	// at 60 Hz under the BQL starves port-I/O-heavy guests like Win9x.
+	// Re-render the guest display at ~30 Hz: with WHPX the VGA code
+	// re-converts the whole surface on every update (no dirty VRAM
+	// tracking), and doing that at 60 Hz under the BQL starves
+	// port-I/O-heavy guests like Win9x.
 	static unsigned tick;
-	if ((tick++ & 1) == 0) {
+	bool rendered = (tick++ & 1) == 0;
+	if (rendered) {
 		CALL_QEMU_FUNC(graphic_hw_update, dcl->con);
 	}
 
 	// Publish the frame: copy it out so the frontend can present it
-	// while QEMU keeps running. This runs on the emu thread under the
-	// BQL, so the copy must be the only thing the frontend can wait on.
-	// Always publish: the frontend re-inits its video driver to black on
-	// geometry changes and only recovers on a real (non-dupe) frame, and
-	// its frame pacing relies on real frames arriving.
-	if (surface && !fx_active) {
+	// while QEMU keeps running. Only ticks that re-rendered can have
+	// changed the surface, so the others skip the copy; retro_run dupes
+	// the previous frame in between. Publish on every rendered tick
+	// though: the frontend re-inits its video driver to black on
+	// geometry changes and only recovers on a real (non-dupe) frame.
+	if (rendered && surface && !fx_active) {
 		int w = surface_width(surface);
 		int h = surface_height(surface);
 		int stride = surface_stride(surface);
