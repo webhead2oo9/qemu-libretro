@@ -99,10 +99,15 @@ the playlist's directory. Two placements work:
   the machine boots from the first one. Optionally, a first line naming
   a `.qemu_cmd_line` file boots that machine instead, with the
   remaining lines as its disc set — one playlist = one game entry, even
-  for an installed OS with a stack of CDs.
+  for an installed OS with a stack of CDs. This is the right shape for
+  game scanners (EmuVR's included) that skip files referenced by a
+  playlist: the whole set scans as a single game.
 - **Sidecar**: a playlist named after the content (`win98.qemu_cmd_line`
   + `win98.m3u`, or `game.iso` + `game.m3u`) seeds the disc set without
-  changing what you open — invisible to game scanners.
+  changing what you open. Best when your scanner doesn't pick up `.m3u`
+  files — a sidecar doesn't reference the content file it accompanies,
+  so a scanner that lists playlists would show both as games; use the
+  playlist-as-content form there instead.
 
 The boot medium (the `.iso` you opened, or the `-cdrom` in the command
 line) is always part of the set, added up front if the playlist doesn't
