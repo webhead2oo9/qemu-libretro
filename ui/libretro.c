@@ -20,6 +20,9 @@
 #include "ui/libretro-vars.h"
 #include "audio/audio.h"
 #include "audio/audio_int.h"
+#include "sysemu/block-backend.h"
+#include "qapi/qapi-commands-block.h"
+#include "qapi/error.h"
 
 #define QEMU_CMD_PREFIX "qemu-system-"
 #define DEFAULT_ARCH "x86_64"
@@ -124,6 +127,41 @@ static int opt_audio_buffer_us;
 static int mouse_speed_pct = 100;
 static int mouse_rem_x, mouse_rem_y; // sub-unit motion carry; retro_run only
 static unsigned restart_notified_mask; // frontend thread only
+
+// Disk control (RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE, v0 — the
+// only version RetroArch 1.7.5 drives). The disc list and tray/index
+// bookkeeping are frontend-thread-only: all seven callbacks and
+// retro_load_game run there. The only cross-thread state is disk_req,
+// handed to disk_swap_bh on the main loop under disk_mutex — the same
+// split as the input state above. Reset at the top of every
+// retro_load_game because statics persist across load cycles.
+static GPtrArray *disc_list; // char *, absolute paths; owns entries
+static unsigned disc_index; // selected disc (== inserted when tray shut)
+static bool tray_ejected; // virtual tray the frontend toggles
+static bool disc_change_pending; // selection changed while tray open
+// Boot descriptor. Written by retro_load_game before the emu thread is
+// created (happens-before, no locks) and selects the argv branch in
+// emu_thread_fn: exactly one non-NULL — a .qemu_cmd_line to parse or a
+// medium for -cdrom; both NULL boots game_path as a bare disk image.
+static char *boot_cmd_line_path;
+static char *boot_cdrom_path;
+// Medium change awaiting disk_swap_bh; a newer request overwrites an
+// unconsumed one, so rapid swaps coalesce to the final selection.
+static struct {
+	bool valid;
+	bool eject; // remove the medium without inserting another
+	char *filename; // owned; medium to insert when !eject
+} disk_req;
+static pthread_mutex_t disk_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Swap bottom half; created on the emu thread once the console exists
+// (display_init), scheduled by disk_commit (legal from any thread).
+static QEMUBH *disk_bh;
+static void disk_swap_bh(void *opaque);
+// These predicates live in internal block-layer headers (block_int-*.h)
+// that don't belong in a common translation unit; declared here so
+// CALL_QEMU_FUNC has their type.
+bool blk_dev_has_removable_media(BlockBackend *blk);
+bool blk_dev_has_tray(BlockBackend *blk);
 
 // Video. QEMU runs free; publishers — refresh() on the emu thread and the
 // qemu-3dfx readback glue on a vCPU thread, both under the BQL — copy each
@@ -402,7 +440,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
 	memset(info, 0, sizeof(*info));
 	info->need_fullpath = true;
-	info->valid_extensions = "qemu_cmd_line|iso|img|qcow|qcow2";
+	info->valid_extensions = "qemu_cmd_line|iso|img|qcow|qcow2|m3u";
 	info->library_version = "0.1.0";
 	info->library_name = "qemu";
 }
@@ -1002,6 +1040,8 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
 	kbd = CALL_QEMU_FUNC(qkbd_state_init, dcl.con);
 	input_bh = CALL_QEMU_FUNC(qemu_bh_new_full, input_inject_bh, NULL,
 				  "libretro-input", NULL);
+	disk_bh = CALL_QEMU_FUNC(qemu_bh_new_full, disk_swap_bh, NULL,
+				 "libretro-disk", NULL);
 	CALL_QEMU_FUNC(register_displaychangelistener, &dcl);
 #ifdef CONFIG_QEMU_3DFX
 	CALL_QEMU_FUNC(qemu_fx_register_sink, &fx_sink);
@@ -1415,6 +1455,301 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
 {
 }
 
+// Parse an .m3u playlist into `out` as absolute paths: one disc image
+// per line, blank lines and '#' comments skipped, UTF-8 BOM and CRLF
+// tolerated, relative entries resolved against the playlist's own
+// directory (not the cwd — the emu thread chdirs later). No nesting.
+// Read failure is a notice, not an error: a missing boot medium is
+// caught by qemu_init, and a missing sidecar disc only matters if the
+// user tries to insert it.
+static void m3u_parse(const char *m3u_path, GPtrArray *out)
+{
+	char *text = NULL;
+	if (!g_file_get_contents(m3u_path, &text, NULL, NULL)) {
+		notice_report("could not read playlist '%s'", m3u_path);
+		return;
+	}
+	char *dir = g_path_get_dirname(m3u_path);
+	char **lines = g_strsplit(text, "\n", -1);
+	g_free(text);
+	for (size_t i = 0; lines[i]; i++) {
+		char *line = lines[i];
+		if (i == 0 && g_str_has_prefix(line, "\xef\xbb\xbf")) {
+			line += 3;
+		}
+		line = g_strstrip(line); // also eats the CR of CRLF files
+		if (!line[0] || line[0] == '#') {
+			continue;
+		}
+		g_ptr_array_add(out, g_path_is_absolute(line) ?
+					     g_canonicalize_filename(line, NULL) :
+					     g_canonicalize_filename(line, dir));
+	}
+	g_strfreev(lines);
+	g_free(dir);
+}
+
+static int disc_find(const char *abs_path)
+{
+	for (unsigned i = 0; i < disc_list->len; i++) {
+		if (!strcmp(disc_list->pdata[i], abs_path)) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+// The medium the machine boots with must be swappable back to, so make
+// sure it's in the disc list (playlist entries keep their listed order
+// after it) and start the disk-control index on it.
+static void disc_ensure_boot(const char *abs_path)
+{
+	if (disc_find(abs_path) < 0) {
+		g_ptr_array_insert(disc_list, 0, g_strdup(abs_path));
+	}
+	disc_index = disc_find(abs_path);
+}
+
+// A playlist sitting next to the content ("foo.iso" + "foo.m3u") seeds
+// the disc list without changing what boots — invisible to frontends
+// and scanners that only know the content file.
+static void sidecar_m3u_parse(const char *content_path)
+{
+	const char *dot = strrchr(content_path, '.');
+	char *m3u = g_strdup_printf("%.*s.m3u", (int)(dot - content_path),
+				    content_path);
+	if (g_file_test(m3u, G_FILE_TEST_IS_REGULAR)) {
+		m3u_parse(m3u, disc_list);
+	}
+	g_free(m3u);
+}
+
+// Best-effort scan for the boot config's -cdrom medium so it lands in
+// the disc list and the disk-control index starts on it; returns
+// whether one was found. Failures are silently ignored here —
+// emu_thread_fn re-parses the file and owns the fatal error path.
+static bool scan_cmd_line_cdrom(const char *cmd_line_path)
+{
+	char *cmd_line = NULL;
+	char **argv = NULL;
+	bool found = false;
+	if (!g_file_get_contents(cmd_line_path, &cmd_line, NULL, NULL)) {
+		return false;
+	}
+	bool ok = g_shell_parse_argv(cmd_line, NULL, &argv, NULL);
+	g_free(cmd_line);
+	if (!ok) {
+		return false;
+	}
+	for (char **p = argv; *p; p++) {
+		if (!strcmp(*p, "-cdrom") && p[1]) {
+			// Relative media resolve against the game dir:
+			// that's QEMU's cwd once emu_thread_fn chdirs.
+			char *dir = g_path_get_dirname(game_path);
+			char *abs = g_path_is_absolute(p[1]) ?
+					    g_canonicalize_filename(p[1], NULL) :
+					    g_canonicalize_filename(p[1], dir);
+			disc_ensure_boot(abs);
+			g_free(abs);
+			g_free(dir);
+			found = true;
+			break;
+		}
+	}
+	g_strfreev(argv);
+	return found;
+}
+
+// Hand the current selection to disk_swap_bh. Frontend thread.
+static void disk_commit(void)
+{
+	pthread_mutex_lock(&disk_mutex);
+	g_free(disk_req.filename);
+	if (disc_index < disc_list->len &&
+	    ((const char *)disc_list->pdata[disc_index])[0]) {
+		disk_req.eject = false;
+		disk_req.filename = g_strdup(disc_list->pdata[disc_index]);
+	} else {
+		// Past the end (frontend removed the disc without
+		// inserting another — RetroArch 1.7.5 clamps and never
+		// sends it) or an append placeholder that never received
+		// its image: leave the drive empty.
+		disk_req.eject = true;
+		disk_req.filename = NULL;
+	}
+	disk_req.valid = true;
+	pthread_mutex_unlock(&disk_mutex);
+	// disk_bh is only created once QEMU is up (display_init), so a
+	// non-NULL pointer means the main loop exists to run it.
+	if (disk_bh && !exited) {
+		CALL_QEMU_FUNC(qemu_bh_schedule, disk_bh);
+	}
+}
+
+// Apply a pending medium change. Runs as a bottom half on the main loop
+// thread under the BQL — the context the qmp_* handlers require.
+static void disk_swap_bh(void *opaque)
+{
+	pthread_mutex_lock(&disk_mutex);
+	bool valid = disk_req.valid;
+	bool eject = disk_req.eject;
+	char *filename = disk_req.filename;
+	disk_req.valid = false;
+	disk_req.filename = NULL;
+	pthread_mutex_unlock(&disk_mutex);
+	if (!valid) {
+		return; // an earlier dispatch already applied the request
+	}
+
+	// Target the machine's first CD-ROM drive: removable media and a
+	// tray (floppies have removable media but no tray).
+	BlockBackend *blk = NULL;
+	for (BlockBackend *b = CALL_QEMU_FUNC(blk_next, NULL); b;
+	     b = CALL_QEMU_FUNC(blk_next, b)) {
+		if (CALL_QEMU_FUNC(blk_dev_has_removable_media, b) &&
+		    CALL_QEMU_FUNC(blk_dev_has_tray, b)) {
+			blk = b;
+			break;
+		}
+	}
+	if (!blk) {
+		notice_report("disc swap: no CD-ROM drive in this machine");
+		g_free(filename);
+		return;
+	}
+
+	// force=true: Windows guests lock the tray (PREVENT MEDIUM
+	// REMOVAL) while a disc is mounted, which would fail the swap
+	// exactly when an installer asks for the next disc. The change
+	// path raises the ATAPI "medium may have changed" sequence, so
+	// the guest re-reads the new disc.
+	const char *dev = CALL_QEMU_FUNC(blk_name, blk);
+	Error *err = NULL;
+	if (eject) {
+		CALL_QEMU_FUNC(qmp_eject, dev, NULL, true, true, &err);
+	} else {
+		CALL_QEMU_FUNC(qmp_blockdev_change_medium, dev, NULL,
+			       filename, NULL, true, true, false,
+			       BLOCKDEV_CHANGE_READ_ONLY_MODE_RETAIN, &err);
+	}
+	if (err) {
+		notice_report("disc swap failed: %s",
+			      CALL_QEMU_FUNC(error_get_pretty, err));
+		CALL_QEMU_FUNC(error_free, err);
+	}
+	g_free(filename);
+}
+
+// The libretro v0 disk-control callbacks (frontend thread). The tray is
+// core-side state: QEMU is only touched when the tray closes on a
+// changed selection, as one atomic medium change — opening and closing
+// the tray without moving the index never disturbs the guest.
+static bool disk_set_eject_state(bool ejected)
+{
+	if (ejected == tray_ejected) {
+		return true;
+	}
+	tray_ejected = ejected;
+	if (ejected) {
+		disc_change_pending = false;
+	} else if (disc_change_pending) {
+		disc_change_pending = false;
+		disk_commit();
+	}
+	return true;
+}
+
+static bool disk_get_eject_state(void)
+{
+	return tray_ejected;
+}
+
+static unsigned disk_get_image_index(void)
+{
+	return disc_index;
+}
+
+static bool disk_set_image_index(unsigned index)
+{
+	if (!tray_ejected) {
+		return false; // only legal while the tray is open
+	}
+	// An unchanged index is a no-op by spec — it must not queue a
+	// re-insert, or open/close without moving the index would fire a
+	// phantom media-change at the guest. A pending change set by
+	// replace_image_index survives.
+	if (index != disc_index) {
+		disc_index = index;
+		disc_change_pending = true;
+	}
+	return true;
+}
+
+static unsigned disk_get_num_images(void)
+{
+	return disc_list ? disc_list->len : 0;
+}
+
+static bool disk_replace_image_index(unsigned index,
+				     const struct retro_game_info *info)
+{
+	if (!disc_list || index >= disc_list->len) {
+		return false;
+	}
+	if (info) {
+		if (!info->path) {
+			return false;
+		}
+		g_free(disc_list->pdata[index]);
+		disc_list->pdata[index] =
+			g_canonicalize_filename(info->path, NULL);
+		if (index == disc_index) {
+			disc_change_pending = true;
+		}
+	} else {
+		// NULL = the frontend dropped this image; the list
+		// shifts down and the selection follows its disc — or
+		// collapses onto the neighbor if its own disc vanished.
+		g_ptr_array_remove_index(disc_list, index);
+		if (index < disc_index) {
+			disc_index--;
+		} else if (index == disc_index) {
+			if (disc_index >= disc_list->len) {
+				disc_index = disc_list->len ?
+						     disc_list->len - 1 :
+						     0;
+			}
+			disc_change_pending = true;
+		}
+	}
+	return true;
+}
+
+static bool disk_add_image_index(void)
+{
+	if (!disc_list) {
+		return false;
+	}
+	// Placeholder slot; the frontend fills it right away with
+	// replace_image_index (the documented append sequence).
+	g_ptr_array_add(disc_list, g_strdup(""));
+	return true;
+}
+
+// Never registered with NULL/empty state: RetroArch 1.7.5 dereferences
+// the env-call data without a NULL check (the documented "deregister"
+// crashes it), and it shows the Disk Options menu whenever the
+// interface exists, even with zero images.
+static const struct retro_disk_control_callback disk_control_cb = {
+	.set_eject_state = disk_set_eject_state,
+	.get_eject_state = disk_get_eject_state,
+	.get_image_index = disk_get_image_index,
+	.set_image_index = disk_set_image_index,
+	.get_num_images = disk_get_num_images,
+	.replace_image_index = disk_replace_image_index,
+	.add_image_index = disk_add_image_index,
+};
+
 static void *emu_thread_fn(void *arg)
 {
 	char *game_dir = g_path_get_dirname(game_path);
@@ -1428,16 +1763,16 @@ static void *emu_thread_fn(void *arg)
 	// retro_unload_game).
 	GPtrArray *args = g_ptr_array_new_with_free_func(g_free);
 
-	if (g_str_has_suffix(game_path, ".qemu_cmd_line")) {
+	if (boot_cmd_line_path) {
 		char *cmd_line = NULL;
 		// Must start NULL: GLib only stores into a NULL GError*, and
 		// the error paths below dereference it.
 		GError *error = NULL;
-		bool success =
-			g_file_get_contents(game_path, &cmd_line, NULL, &error);
+		bool success = g_file_get_contents(boot_cmd_line_path,
+						   &cmd_line, NULL, &error);
 		if (!success) {
 			early_error_report("failed reading file '%s':\n%s",
-					   game_path, error->message);
+					   boot_cmd_line_path, error->message);
 			return NULL;
 		}
 		char **argv;
@@ -1445,27 +1780,28 @@ static void *emu_thread_fn(void *arg)
 		g_free(cmd_line);
 		if (!success) {
 			early_error_report("failed parsing file '%s':\n%s",
-					   game_path, error->message);
+					   boot_cmd_line_path, error->message);
 			return NULL;
 		}
 		if (!argv[0]) {
 			early_error_report("empty command in file '%s'",
-					   game_path);
+					   boot_cmd_line_path);
 			return NULL;
 		}
 		if (!g_str_has_prefix(argv[0], QEMU_CMD_PREFIX)) {
 			early_error_report(
 				"command must be of the form " QEMU_CMD_PREFIX
 				"ARCH, not '%s': '%s'",
-				argv[0], game_path);
+				argv[0], boot_cmd_line_path);
 			return NULL;
 		}
 		for (char **p = argv; *p; p++) {
 			g_ptr_array_add(args, *p);
 		}
 		g_free(argv); // tokens now owned by args
-	} else if (g_str_has_suffix(game_path, ".iso")) {
-		const char *base[] = { QEMU_CMD, "-cdrom", game_path, NULL };
+	} else if (boot_cdrom_path) {
+		const char *base[] = { QEMU_CMD, "-cdrom", boot_cdrom_path,
+				       NULL };
 		for (const char **p = base; *p; p++) {
 			g_ptr_array_add(args, g_strdup(*p));
 		}
@@ -1496,6 +1832,34 @@ bool retro_load_game(const struct retro_game_info *game)
 		return false;
 	}
 
+	// Fresh disk-control state; statics persist across load cycles
+	// and the previous emu thread (if any) is already joined.
+	pthread_mutex_lock(&disk_mutex);
+	g_free(disk_req.filename);
+	disk_req.filename = NULL;
+	disk_req.valid = false;
+	disk_req.eject = false;
+	pthread_mutex_unlock(&disk_mutex);
+	if (disc_list) {
+		g_ptr_array_set_size(disc_list, 0);
+	} else {
+		disc_list = g_ptr_array_new_with_free_func(g_free);
+	}
+	disc_index = 0;
+	tray_ejected = false;
+	disc_change_pending = false;
+	g_free(boot_cmd_line_path);
+	g_free(boot_cdrom_path);
+	boot_cmd_line_path = NULL;
+	boot_cdrom_path = NULL;
+	// Session flags too: the API guarantees retro_unload_game ran (and
+	// joined the previous emu thread), but a stale exited=true would
+	// silently stop the new session's BH scheduling (input and disk)
+	// and make retro_run request shutdown immediately.
+	exited = false;
+	emu_thread_started = false;
+	emu_thread_joined = false;
+
 	// The frontend only guarantees game->path stays valid during this
 	// call, and old frontends (RetroArch 1.7.5-era) reuse the
 	// string quickly, so copy it before the emu thread reads it.
@@ -1508,6 +1872,56 @@ bool retro_load_game(const struct retro_game_info *game)
 	// thread-creation happens-before lets emu_thread_fn read the opt_*
 	// statics without locking.
 	update_variables(true);
+	// Content dispatch: the boot descriptor picks the argv branch in
+	// emu_thread_fn, the disc list feeds the disk-control interface.
+	// Everything is canonicalized while the cwd is still the
+	// frontend's, and published by pthread_create below.
+	if (g_str_has_suffix(game_path, ".m3u")) {
+		GPtrArray *entries = g_ptr_array_new_with_free_func(g_free);
+		m3u_parse(game_path, entries);
+		unsigned first_disc = 0;
+		if (entries->len &&
+		    g_str_has_suffix(entries->pdata[0], ".qemu_cmd_line")) {
+			// First entry names the boot config; the rest
+			// are the disc set.
+			boot_cmd_line_path = g_strdup(entries->pdata[0]);
+			first_disc = 1;
+		}
+		for (unsigned i = first_disc; i < entries->len; i++) {
+			g_ptr_array_add(disc_list,
+					g_strdup(entries->pdata[i]));
+		}
+		g_ptr_array_free(entries, TRUE);
+		if (!boot_cmd_line_path) {
+			if (!disc_list->len) {
+				notice_report("playlist '%s' lists no discs",
+					      game_path);
+				return false;
+			}
+			boot_cdrom_path = g_strdup(disc_list->pdata[0]);
+		}
+	} else if (g_str_has_suffix(game_path, ".qemu_cmd_line")) {
+		boot_cmd_line_path = g_strdup(game_path);
+		sidecar_m3u_parse(game_path);
+	} else if (g_str_has_suffix(game_path, ".iso")) {
+		boot_cdrom_path = g_strdup(game_path);
+		sidecar_m3u_parse(game_path);
+	}
+	if (boot_cmd_line_path) {
+		if (!scan_cmd_line_cdrom(boot_cmd_line_path)) {
+			// No boot medium: the drive starts empty, which
+			// the v0 API spells index >= get_num_images() —
+			// starting at 0 would make disc 0 uninsertable
+			// (an unchanged index is a no-op by spec).
+			disc_index = disc_list->len;
+		}
+	} else if (boot_cdrom_path) {
+		disc_ensure_boot(boot_cdrom_path);
+	}
+	if (disc_list->len > 0) {
+		cb_env(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE,
+		       (void *)&disk_control_cb);
+	}
 	// The frontend sized its texture from retro_get_system_av_info, so
 	// the delivered envelope starts at whatever base that reported
 	// (av_info persists across load cycles).

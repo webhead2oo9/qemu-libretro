@@ -31,7 +31,7 @@ fail with `could not load PC BIOS 'bios-256k.bin'`.
 
 ## Usage
 
-You can open a `.iso`, `.img`, `.qcow`, or `.qcow2` file,
+You can open a `.iso`, `.img`, `.qcow`, `.qcow2`, or `.m3u` file,
 and it will be run with the command
 
 ``` sh
@@ -79,6 +79,42 @@ appended if missing. Specifics:
 On RetroArch 1.7.5-era frontends (EmuVR) core options are global to the
 core, not per-game; per-game tuning still belongs in the
 `.qemu_cmd_line` and the 3dfx cfg files.
+
+### Multi-disc / CD swapping (Disk Control)
+
+The core implements the libretro disk-control interface, so multi-CD
+installs and multi-disc games work from the frontend without touching
+QEMU: in RetroArch 1.7.5 open **Quick Menu → Disk Options**, then
+**Disk Cycle Tray Status** (opens the virtual tray), change **Disk
+Index** with left/right, and **Disk Cycle Tray Status** again to close
+the tray and insert the disc. **Disk Image Append** adds a new image
+from a file browser and inserts it immediately. The guest sees a real
+ATAPI medium change, so Windows re-reads the new disc on its own.
+
+Declare a disc set with an `.m3u` playlist — one image path per line,
+blank lines and `#` comments ignored, relative paths resolved against
+the playlist's directory. Two placements work:
+
+- **Playlist as content**: open the `.m3u` itself. Each line is a disc;
+  the machine boots from the first one. Optionally, a first line naming
+  a `.qemu_cmd_line` file boots that machine instead, with the
+  remaining lines as its disc set — one playlist = one game entry, even
+  for an installed OS with a stack of CDs.
+- **Sidecar**: a playlist named after the content (`win98.qemu_cmd_line`
+  + `win98.m3u`, or `game.iso` + `game.m3u`) seeds the disc set without
+  changing what you open — invisible to game scanners.
+
+The boot medium (the `.iso` you opened, or the `-cdrom` in the command
+line) is always part of the set, added up front if the playlist doesn't
+list it. If a command-line machine has no `-cdrom`, the drive starts
+empty — pick a disc index and close the tray to insert one (the machine
+still needs a CD-ROM drive, so give it a `-cdrom` or `-drive
+media=cdrom`; without one the core reports "no CD-ROM drive").
+
+Notes: swaps force the tray even while the guest locks it (the
+real-hardware equivalent of the emergency-eject pin — installers lock
+the tray exactly when they ask for the next disc); machines with
+several CD drives swap on the first one; playlists don't nest.
 
 ### Hardware virtualization (Windows)
 
