@@ -1002,7 +1002,28 @@ void whpx_get_registers(CPUState *cpu, WHPXStateLevel level)
     x86_update_hflags(env);
 }
 
-static int emulate_instruction(CPUState *cpu, const uint8_t *insn_bytes, size_t insn_len)
+static void whpx_mmu_cache_reset(CPUState *cpu)
+{
+    AccelCPUState *vcpu = cpu->accel;
+
+    for (int i = 0; i < WHPX_MMU_CACHE_SIZE; i++) {
+        vcpu->mmu_cache[i].valid = false;
+    }
+    vcpu->mmu_cache_next = 0;
+}
+
+/*
+ * emulate_instruction: mmio_ctx, when given, is the memory-access exit
+ * context of the instruction being emulated; its hardware-provided
+ * GVA->GPA pair pre-seeds the per-instruction translation cache so the
+ * common single-MMIO case needs no WHvTranslateGva hypercall at all.
+ * The hardware page walk behind that pair already set the guest PTE
+ * accessed (and, for writes, dirty) bits, and it passed privilege
+ * checks at the current CPL, so the seed is marked accordingly.
+ */
+static int emulate_instruction(CPUState *cpu, const uint8_t *insn_bytes,
+                               size_t insn_len,
+                               const WHV_MEMORY_ACCESS_CONTEXT *mmio_ctx)
 {
     X86CPU *x86_cpu = X86_CPU(cpu);
     CPUX86State *env = &x86_cpu->env;
@@ -1010,6 +1031,22 @@ static int emulate_instruction(CPUState *cpu, const uint8_t *insn_bytes, size_t 
     x86_insn_stream stream = { .bytes = insn_bytes, .len = insn_len };
 
     whpx_get_registers(cpu, WHPX_LEVEL_FAST_RUNTIME_STATE);
+
+    whpx_mmu_cache_reset(cpu);
+    if (mmio_ctx && mmio_ctx->AccessInfo.GvaValid) {
+        AccelCPUState *vcpu = cpu->accel;
+
+        vcpu->mmu_cache[0] = (struct whpx_mmu_cache_entry){
+            .gva_page = mmio_ctx->Gva & ~(uint64_t)0xfff,
+            .gpa_page = mmio_ctx->Gpa & ~(uint64_t)0xfff,
+            .valid = true,
+            .write_ok =
+                mmio_ctx->AccessInfo.AccessType == WHvMemoryAccessWrite,
+            .priv_ok = true,
+        };
+        vcpu->mmu_cache_next = 1;
+    }
+
     decode_instruction_stream(env, &decode, &stream);
     exec_instruction(env, &decode);
     whpx_set_registers(cpu, WHPX_LEVEL_FAST_RUNTIME_STATE);
@@ -1026,6 +1063,7 @@ static int emulate_msr_instruction(CPUState *cpu,
     x86_insn_stream stream = { .bytes = insn_bytes, .len = insn_len };
 
     whpx_get_registers(cpu, WHPX_LEVEL_FAST_RUNTIME_STATE);
+    whpx_mmu_cache_reset(cpu);
     decode_instruction_stream(env, &decode, &stream);
 
     if (decode.cmd != X86_DECODE_CMD_RDMSR
@@ -1043,7 +1081,8 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
-    ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+    ret = emulate_instruction(cpu, ctx->InstructionBytes,
+                              ctx->InstructionByteCount, ctx);
     if (ret < 0) {
         error_report("failed to emulate mmio");
         return -1;
@@ -1155,7 +1194,10 @@ static int whpx_handle_portio(CPUState *cpu,
         return 0;
     }
 
-    ret = emulate_instruction(cpu, ctx->InstructionBytes, exit_ctx->VpContext.InstructionLength);
+    /* String port I/O exits carry no memory-access context to seed the
+     * translation cache from; it fills from the hypercalls instead. */
+    ret = emulate_instruction(cpu, ctx->InstructionBytes,
+                              exit_ctx->VpContext.InstructionLength, NULL);
     if (ret < 0) {
         error_report("failed to emulate I/O port access");
         return -1;
@@ -1318,6 +1360,36 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
     return 0;
 }
 
+static void whpx_mmu_cache_insert(CPUState *cpu, uint64_t gva_page,
+                                  uint64_t gpa_page, bool write_ok,
+                                  bool priv_ok)
+{
+    AccelCPUState *vcpu = cpu->accel;
+    struct whpx_mmu_cache_entry *e;
+
+    for (int i = 0; i < WHPX_MMU_CACHE_SIZE; i++) {
+        e = &vcpu->mmu_cache[i];
+        if (e->valid && e->gva_page == gva_page) {
+            /* sticky upgrades only: a later, weaker translation must
+             * not downgrade what an earlier one already proved */
+            e->gpa_page = gpa_page;
+            e->write_ok |= write_ok;
+            e->priv_ok |= priv_ok;
+            return;
+        }
+    }
+
+    e = &vcpu->mmu_cache[vcpu->mmu_cache_next];
+    vcpu->mmu_cache_next = (vcpu->mmu_cache_next + 1) % WHPX_MMU_CACHE_SIZE;
+    *e = (struct whpx_mmu_cache_entry){
+        .gva_page = gva_page,
+        .gpa_page = gpa_page,
+        .valid = true,
+        .write_ok = write_ok,
+        .priv_ok = priv_ok,
+    };
+}
+
 /*
  * Translate through the hypervisor so the guest PTE accessed/dirty bits
  * are updated (WHvTranslateGvaFlagSetPageTableBits), matching what real
@@ -1327,6 +1399,13 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
  * (e.g. Win9x BIOS/driver INS into the file cache): without the dirty bit
  * the guest's pager considers the emulator-filled page clean and may
  * silently discard it, corrupting reads that were never re-fetched.
+ *
+ * Repeat translations of the same page within one emulated instruction
+ * are served from the per-instruction cache. That is compatible with
+ * the contract above: the first write to a page always reaches the
+ * hypervisor with ValidateWrite|SetPageTableBits (a cached read-only
+ * entry never satisfies a write lookup), and once the dirty bit is set,
+ * setting it again for the remaining string elements would be a no-op.
  */
 static MMUTranslateResult whpx_mmu_gva_to_gpa(CPUState *cpu, target_ulong gva,
                                               uint64_t *gpa,
@@ -1336,11 +1415,34 @@ static MMUTranslateResult whpx_mmu_gva_to_gpa(CPUState *cpu, target_ulong gva,
     WHV_TRANSLATE_GVA_RESULT res;
     WHV_GUEST_PHYSICAL_ADDRESS res_gpa;
     WHV_TRANSLATE_GVA_FLAGS wflags;
+    MMUTranslateResult walk_res;
     HRESULT hr;
 
     if (!x86_is_paging_mode(cpu)) {
         *gpa = gva;
         return MMU_TRANSLATE_SUCCESS;
+    }
+
+    uint64_t gva_page = gva & ~(uint64_t)0xfff;
+    bool want_write = flags & MMU_TRANSLATE_VALIDATE_WRITE;
+    bool priv_checked = !(flags & MMU_TRANSLATE_PRIV_CHECKS_EXEMPT);
+    /* execute validation is rare and proves neither read nor write
+     * permission; keep it away from the cache entirely */
+    bool cacheable = !(flags & MMU_TRANSLATE_VALIDATE_EXECUTE);
+
+    if (cacheable) {
+        AccelCPUState *vcpu = cpu->accel;
+
+        for (int i = 0; i < WHPX_MMU_CACHE_SIZE; i++) {
+            struct whpx_mmu_cache_entry *e = &vcpu->mmu_cache[i];
+
+            if (e->valid && e->gva_page == gva_page &&
+                (!want_write || e->write_ok) &&
+                (!priv_checked || e->priv_ok)) {
+                *gpa = e->gpa_page | (gva & 0xfff);
+                return MMU_TRANSLATE_SUCCESS;
+            }
+        }
     }
 
     if (flags & MMU_TRANSLATE_VALIDATE_WRITE) {
@@ -1361,6 +1463,10 @@ static MMUTranslateResult whpx_mmu_gva_to_gpa(CPUState *cpu, target_ulong gva,
         switch (res.ResultCode) {
         case WHvTranslateGvaResultSuccess:
             *gpa = (res_gpa & ~(uint64_t)0xfff) | (gva & 0xfff);
+            if (cacheable) {
+                whpx_mmu_cache_insert(cpu, gva_page, res_gpa & ~(uint64_t)0xfff,
+                                      want_write, priv_checked);
+            }
             return MMU_TRANSLATE_SUCCESS;
         case WHvTranslateGvaResultPageNotPresent:
             return MMU_TRANSLATE_PAGE_NOT_MAPPED;
@@ -1375,7 +1481,14 @@ static MMUTranslateResult whpx_mmu_gva_to_gpa(CPUState *cpu, target_ulong gva,
         }
     }
 
-    return mmu_gva_to_gpa_walk(cpu, gva, gpa, flags);
+    walk_res = mmu_gva_to_gpa_walk(cpu, gva, gpa, flags);
+    if (walk_res == MMU_TRANSLATE_SUCCESS && cacheable) {
+        /* MMIO destinations land here every element of a string op;
+         * they are exactly as cacheable as RAM pages */
+        whpx_mmu_cache_insert(cpu, gva_page, *gpa & ~(uint64_t)0xfff,
+                              want_write, priv_checked);
+    }
+    return walk_res;
 }
 
 static const struct x86_emul_ops whpx_x86_emul_ops = {
