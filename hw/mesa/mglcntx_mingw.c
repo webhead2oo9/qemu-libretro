@@ -266,12 +266,20 @@ void MGLTmpContext(void)
     }
 }
 
-#define GLWINDOW_INIT() \
-    if (hDC == 0) { if (0) \
-    CreateMesaWindow("MesaGL", 640, 480, 1); \
-    qatomic_set(&wnd_ready, 0); \
-    ImplMesaGLReset(); \
-    mesa_prepare_window(GetContextMSAA(), GLon12, 0, &cwnd_mesagl); hDC = GetDC(hwnd); }
+static int MGLWindowInit(void)
+{
+    if (hDC)
+        return 1;
+
+    qatomic_set(&wnd_ready, 0);
+    ImplMesaGLReset();
+    mesa_prepare_window(GetContextMSAA(), GLon12, 0, &cwnd_mesagl);
+
+    /* qemu-libretro can deny activation and pause a multi-vCPU VM. The
+     * temporary discovery window still lives in hwnd, so never recover a DC
+     * from it here: only cwnd_mesagl may publish a ready render window/DC. */
+    return hDC && qatomic_read(&wnd_ready);
+}
 
 #define GLWINDOW_FINI() \
     if (0) { } \
@@ -408,7 +416,8 @@ static int MGLPresetPixelFormat(void)
 int MGLChoosePixelFormat(void)
 {
     int fmt, curr;
-    GLWINDOW_INIT();
+    if (!MGLWindowInit())
+        return 0;
     curr = GetPixelFormat(hDC);
     if (curr == 0)
         curr = MGLPresetPixelFormat();
@@ -421,7 +430,8 @@ int MGLSetPixelFormat(int fmt, const void *p)
 {
     const PIXELFORMATDESCRIPTOR *ppfd = (const PIXELFORMATDESCRIPTOR *)p;
     int curr, ret;
-    GLWINDOW_INIT();
+    if (!MGLWindowInit())
+        return 0;
     curr = GetPixelFormat(hDC);
     if (curr == 0) {
         curr = MGLPresetPixelFormat();
@@ -453,7 +463,8 @@ int MGLDescribePixelFormat(int fmt, unsigned int sz, void *p)
 {
     LPPIXELFORMATDESCRIPTOR ppfd = (LPPIXELFORMATDESCRIPTOR)p;
     int curr;
-    GLWINDOW_INIT();
+    if (!MGLWindowInit())
+        return 0;
     curr = GetPixelFormat(hDC);
     if (curr == 0)
         curr = MGLPresetPixelFormat();
