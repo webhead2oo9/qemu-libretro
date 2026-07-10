@@ -53,8 +53,9 @@ yourself if you want sound.
 Common knobs are also exposed as core options (in RetroArch: Quick Menu →
 Options), so many setups need no hand-edited command line at all:
 
-- **Guest RAM**, **Boot device**, **CPU accelerator**, **Audio buffer** —
-  take effect on the next restart of the content.
+- **Guest RAM**, **Boot device**, **CPU accelerator**, **WHPX security
+  isolation**, **Audio buffer** — take effect on the next restart of the
+  content.
 - **Mouse speed** — live.
 - **3D FPS limit**, **3D GL extensions year** — global defaults for the
   qemu-3dfx pass-through; picked up when the guest starts its next 3D app.
@@ -68,13 +69,21 @@ appended if missing. Specifics:
   TCG without editing files. If your command line uses the
   `-machine accel=…` spelling instead of `-accel`, the two will conflict;
   use the `-accel` form.
+- **WHPX security isolation** edits the `ssd=` property of every
+  `-accel whpx` entry while preserving its other properties and fallback
+  accelerators. `auto` leaves the command line alone and WHPX defaults to
+  secure isolation. `off (trusted guests only)` can significantly improve
+  MMIO-heavy workloads by skipping VM-entry/exit side-channel mitigations;
+  use it only with guest software and disk images you trust.
 - **Audio buffer** rewrites `out.buffer-length` on the libretro audiodev,
   and is skipped (with a notice) when the command line has no libretro
   audiodev.
 - The **3D** options override `FpsLimit`/`ExtensionsYear` after the cfg
   files are read — precedence is core option > per-game
   `mesagl.cfg`/`glide.cfg` > built-in — and the cfg files are never
-  written to.
+  written to. On a 60 Hz frontend, 60 FPS is the efficient pacing choice;
+  120 FPS can reduce frame age but roughly doubles guest rendering, MMIO,
+  and host-GPU work. Higher values do not raise the frontend's 60 Hz rate.
 
 On RetroArch 1.7.5-era frontends (EmuVR) core options are global to the
 core, not per-game; per-game tuning still belongs in the

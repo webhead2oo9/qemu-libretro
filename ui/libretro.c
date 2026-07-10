@@ -120,9 +120,16 @@ static const struct choice mouse_speed_choices[] = {
 	{ "50%", 50 },	 { "75%", 75 },	  { "100%", 100 },
 	{ "150%", 150 }, { "200%", 200 }, { NULL, 0 },
 };
+static const struct choice whpx_isolation_choices[] = {
+	{ "on", 1 },
+	{ "off (trusted guests only)", -1 },
+	{ NULL, 0 },
+};
 static int opt_ram_mb;
 static char opt_boot_order_char;
 static const char *opt_accel; // "whpx"/"tcg" string literal, or NULL
+// 0 = auto/leave argv alone, 1 = secure isolation on, -1 = performance mode.
+static int opt_whpx_isolation;
 static int opt_audio_buffer_us;
 static int mouse_speed_pct = 100;
 static int mouse_rem_x, mouse_rem_y; // sub-unit motion carry; retro_run only
@@ -633,6 +640,8 @@ static const struct retro_variable qemu_core_variables[] = {
 	  "Guest RAM (restart); auto|64 MB|128 MB|256 MB|512 MB|1 GB|2 GB" },
 	{ "qemu_boot_order", "Boot device (restart); auto|hard disk|CD-ROM|floppy" },
 	{ "qemu_accel", "CPU accelerator (restart); auto|WHPX|TCG" },
+	{ "qemu_whpx_isolation",
+	  "WHPX security isolation (restart); auto|on|off (trusted guests only)" },
 	{ "qemu_audio_buffer", "Audio buffer (restart); auto|32 ms|48 ms|64 ms|128 ms" },
 	{ "qemu_mouse_speed", "Mouse speed; 100%|50%|75%|150%|200%" },
 #ifdef CONFIG_QEMU_3DFX
@@ -1274,6 +1283,8 @@ static void update_variables(bool first_load)
 	int ram = parse_choice(ram_choices, get_var("qemu_ram"));
 	int boot = parse_choice(boot_choices, get_var("qemu_boot_order"));
 	const char *accel = parse_accel(get_var("qemu_accel"));
+	int whpx_isolation = parse_choice(whpx_isolation_choices,
+					  get_var("qemu_whpx_isolation"));
 	int abuf = parse_choice(audio_buffer_choices,
 				get_var("qemu_audio_buffer"));
 
@@ -1281,6 +1292,7 @@ static void update_variables(bool first_load)
 		opt_ram_mb = ram;
 		opt_boot_order_char = boot;
 		opt_accel = accel;
+		opt_whpx_isolation = whpx_isolation;
 		opt_audio_buffer_us = abuf;
 	} else {
 		const struct {
@@ -1292,6 +1304,8 @@ static void update_variables(bool first_load)
 			// Pointer compare is exact: parse_accel returns
 			// interned literals or NULL.
 			{ accel != opt_accel, "CPU accelerator" },
+			{ whpx_isolation != opt_whpx_isolation,
+			  "WHPX security isolation" },
 			{ abuf != opt_audio_buffer_us, "Audio buffer" },
 		};
 		for (size_t i = 0; i < G_N_ELEMENTS(boot_opts); i++) {
@@ -1389,6 +1403,45 @@ static void apply_audio_buffer(GPtrArray *args, int usecs)
 		"Audio buffer option ignored: no libretro audiodev in the command line");
 }
 
+// Set the WHPX SeparateSecurityDomain accelerator property without
+// disturbing fallback accelerators or unrelated WHPX properties. QEMU's
+// default is isolation on; this only runs for an explicit non-auto option.
+static void apply_whpx_isolation(GPtrArray *args, bool enabled)
+{
+	bool found = false;
+
+	for (guint i = 0; i + 1 < args->len; i++) {
+		const char *spec = args->pdata[i + 1];
+
+		if (strcmp(args->pdata[i], "-accel") != 0 ||
+		    (strcmp(spec, "whpx") != 0 &&
+		     !g_str_has_prefix(spec, "whpx,"))) {
+			continue;
+		}
+
+		char **parts = g_strsplit(spec, ",", -1);
+		GString *out = g_string_new("whpx");
+
+		for (char **p = parts + 1; *p; p++) {
+			if (g_str_has_prefix(*p, "ssd=")) {
+				continue;
+			}
+			g_string_append_c(out, ',');
+			g_string_append(out, *p);
+		}
+		g_string_append_printf(out, ",ssd=%s", enabled ? "on" : "off");
+		g_strfreev(parts);
+		g_free(args->pdata[i + 1]);
+		args->pdata[i + 1] = g_string_free(out, FALSE);
+		found = true;
+	}
+
+	if (!found) {
+		notice_report(
+			"WHPX security isolation option ignored: no -accel whpx entry in the command line");
+	}
+}
+
 static void apply_option_overrides(GPtrArray *args)
 {
 	char buf[16];
@@ -1409,6 +1462,9 @@ static void apply_option_overrides(GPtrArray *args)
 		args_remove_all(args, "-accel");
 		g_ptr_array_add(args, g_strdup("-accel"));
 		g_ptr_array_add(args, g_strdup(opt_accel));
+	}
+	if (opt_whpx_isolation) {
+		apply_whpx_isolation(args, opt_whpx_isolation > 0);
 	}
 	if (opt_audio_buffer_us) {
 		apply_audio_buffer(args, opt_audio_buffer_us);
