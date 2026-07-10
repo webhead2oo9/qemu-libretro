@@ -43,6 +43,7 @@ struct USBHIDState {
     uint32_t usb_version;
     char *display;
     uint32_t head;
+    uint32_t index;
 };
 
 #define TYPE_USB_HID "usb-hid"
@@ -53,13 +54,16 @@ enum {
     STR_PRODUCT_MOUSE,
     STR_PRODUCT_TABLET,
     STR_PRODUCT_KEYBOARD,
+    STR_PRODUCT_GAMEPAD,
     STR_SERIAL_COMPAT,
     STR_CONFIG_MOUSE,
     STR_CONFIG_TABLET,
     STR_CONFIG_KEYBOARD,
+    STR_CONFIG_GAMEPAD,
     STR_SERIAL_MOUSE,
     STR_SERIAL_TABLET,
     STR_SERIAL_KEYBOARD,
+    STR_SERIAL_GAMEPAD,
 };
 
 static const USBDescStrings desc_strings = {
@@ -67,13 +71,16 @@ static const USBDescStrings desc_strings = {
     [STR_PRODUCT_MOUSE]    = "QEMU USB Mouse",
     [STR_PRODUCT_TABLET]   = "QEMU USB Tablet",
     [STR_PRODUCT_KEYBOARD] = "QEMU USB Keyboard",
+    [STR_PRODUCT_GAMEPAD]  = "QEMU USB Gamepad",
     [STR_SERIAL_COMPAT]    = "42",
     [STR_CONFIG_MOUSE]     = "HID Mouse",
     [STR_CONFIG_TABLET]    = "HID Tablet",
     [STR_CONFIG_KEYBOARD]  = "HID Keyboard",
+    [STR_CONFIG_GAMEPAD]   = "HID Gamepad",
     [STR_SERIAL_MOUSE]     = "89126",
     [STR_SERIAL_TABLET]    = "28754",
     [STR_SERIAL_KEYBOARD]  = "68284",
+    [STR_SERIAL_GAMEPAD]   = "97531",
 };
 
 static const USBDescIface desc_iface_mouse = {
@@ -260,6 +267,37 @@ static const USBDescIface desc_iface_keyboard2 = {
     },
 };
 
+static const USBDescIface desc_iface_gamepad = {
+    .bInterfaceNumber              = 0,
+    .bNumEndpoints                 = 1,
+    .bInterfaceClass               = USB_CLASS_HID,
+    .bInterfaceSubClass            = 0x00,
+    .bInterfaceProtocol            = 0x00,
+    .ndesc                         = 1,
+    .descs = (USBDescOther[]) {
+        {
+            /* HID 1.11 descriptor, followed by an 80-byte report descriptor. */
+            .data = (uint8_t[]) {
+                0x09,
+                USB_DT_HID,
+                0x11, 0x01,
+                0x00,
+                0x01,
+                USB_DT_REPORT,
+                80, 0,
+            },
+        },
+    },
+    .eps = (USBDescEndpoint[]) {
+        {
+            .bEndpointAddress      = USB_DIR_IN | 0x01,
+            .bmAttributes          = USB_ENDPOINT_XFER_INT,
+            .wMaxPacketSize        = 16,
+            .bInterval             = 0x0a,
+        },
+    },
+};
+
 static const USBDescDevice desc_device_mouse = {
     .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 8,
@@ -362,6 +400,23 @@ static const USBDescDevice desc_device_keyboard2 = {
     },
 };
 
+static const USBDescDevice desc_device_gamepad = {
+    .bcdUSB                        = 0x0110,
+    .bMaxPacketSize0               = 8,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 1,
+            .bConfigurationValue   = 1,
+            .iConfiguration        = STR_CONFIG_GAMEPAD,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
+            .bMaxPower             = 50,
+            .nif = 1,
+            .ifs = &desc_iface_gamepad,
+        },
+    },
+};
+
 static const USBDescMSOS desc_msos_suspend = {
     .SelectiveSuspendEnabled = true,
 };
@@ -449,6 +504,20 @@ static const USBDesc desc_keyboard2 = {
     },
     .full = &desc_device_keyboard,
     .high = &desc_device_keyboard2,
+    .str  = desc_strings,
+    .msos = &desc_msos_suspend,
+};
+
+static const USBDesc desc_gamepad = {
+    .id = {
+        .idVendor          = 0x0627,
+        .idProduct         = 0x0002,
+        .bcdDevice         = 0x0001,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT_GAMEPAD,
+        .iSerialNumber     = STR_SERIAL_GAMEPAD,
+    },
+    .full = &desc_device_gamepad,
     .str  = desc_strings,
     .msos = &desc_msos_suspend,
 };
@@ -558,6 +627,51 @@ static const uint8_t qemu_keyboard_hid_report_descriptor[] = {
     0xc0,		/* End Collection */
 };
 
+/* Four signed 16-bit axes, a nullable four-bit POV hat, and 12 buttons.
+ * Keep the report compact and descriptor-only so Windows 98SE and XP bind
+ * their generic USB HID game-controller stack without a vendor driver. */
+static const uint8_t qemu_gamepad_hid_report_descriptor[] = {
+    0x05, 0x01,             /* Usage Page (Generic Desktop) */
+    0x09, 0x05,             /* Usage (Game Pad) */
+    0xa1, 0x01,             /* Collection (Application) */
+    0x05, 0x01,             /*   Usage Page (Generic Desktop) */
+    0x09, 0x30,             /*   Usage (X) */
+    0x09, 0x31,             /*   Usage (Y) */
+    0x09, 0x33,             /*   Usage (Rx) */
+    0x09, 0x34,             /*   Usage (Ry) */
+    0x16, 0x00, 0x80,       /*   Logical Minimum (-32768) */
+    0x26, 0xff, 0x7f,       /*   Logical Maximum (32767) */
+    0x75, 0x10,             /*   Report Size (16) */
+    0x95, 0x04,             /*   Report Count (4) */
+    0x81, 0x02,             /*   Input (Data, Variable, Absolute) */
+    0x05, 0x01,             /*   Usage Page (Generic Desktop) */
+    0x09, 0x39,             /*   Usage (Hat Switch) */
+    0x15, 0x00,             /*   Logical Minimum (0) */
+    0x25, 0x07,             /*   Logical Maximum (7) */
+    0x35, 0x00,             /*   Physical Minimum (0) */
+    0x46, 0x3b, 0x01,       /*   Physical Maximum (315) */
+    0x65, 0x14,             /*   Unit (Degrees) */
+    0x75, 0x04,             /*   Report Size (4) */
+    0x95, 0x01,             /*   Report Count (1) */
+    0x81, 0x42,             /*   Input (Data, Variable, Absolute, Null) */
+    0x65, 0x00,             /*   Unit (None) */
+    0x75, 0x04,             /*   Report Size (4) */
+    0x95, 0x01,             /*   Report Count (1) */
+    0x81, 0x01,             /*   Input (Constant) */
+    0x05, 0x09,             /*   Usage Page (Button) */
+    0x19, 0x01,             /*   Usage Minimum (1) */
+    0x29, 0x0c,             /*   Usage Maximum (12) */
+    0x15, 0x00,             /*   Logical Minimum (0) */
+    0x25, 0x01,             /*   Logical Maximum (1) */
+    0x75, 0x01,             /*   Report Size (1) */
+    0x95, 0x0c,             /*   Report Count (12) */
+    0x81, 0x02,             /*   Input (Data, Variable, Absolute) */
+    0x75, 0x04,             /*   Report Size (4) */
+    0x95, 0x01,             /*   Report Count (1) */
+    0x81, 0x01,             /*   Input (Constant) */
+    0xc0,                   /* End Collection */
+};
+
 static void usb_hid_changed(HIDState *hs)
 {
     USBHIDState *us = container_of(hs, USBHIDState, hid);
@@ -601,6 +715,10 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
                 memcpy(data, qemu_keyboard_hid_report_descriptor,
                        sizeof(qemu_keyboard_hid_report_descriptor));
                 p->actual_length = sizeof(qemu_keyboard_hid_report_descriptor);
+            } else if (hs->kind == HID_GAMEPAD) {
+                memcpy(data, qemu_gamepad_hid_report_descriptor,
+                       sizeof(qemu_gamepad_hid_report_descriptor));
+                p->actual_length = sizeof(qemu_gamepad_hid_report_descriptor);
             }
             break;
         default:
@@ -612,6 +730,8 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
             p->actual_length = hid_pointer_poll(hs, data, length);
         } else if (hs->kind == HID_KEYBOARD) {
             p->actual_length = hid_keyboard_poll(hs, data, length);
+        } else if (hs->kind == HID_GAMEPAD) {
+            p->actual_length = hid_gamepad_poll(hs, data, length);
         }
         break;
     case HID_SET_REPORT:
@@ -674,6 +794,8 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
                 len = hid_pointer_poll(hs, buf, p->iov.size);
             } else if (hs->kind == HID_KEYBOARD) {
                 len = hid_keyboard_poll(hs, buf, p->iov.size);
+            } else if (hs->kind == HID_GAMEPAD) {
+                len = hid_gamepad_poll(hs, buf, p->iov.size);
             }
             usb_packet_copy(p, buf, len);
         } else {
@@ -719,7 +841,15 @@ static void usb_hid_initfn(USBDevice *dev, int kind,
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
     us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
-    hid_init(&us->hid, kind, usb_hid_changed);
+    if (kind == HID_GAMEPAD) {
+        if (!hid_gamepad_init(&us->hid, us->index, usb_hid_changed)) {
+            error_setg(errp, "gamepad index %u is invalid or already in use",
+                       us->index);
+            return;
+        }
+    } else {
+        hid_init(&us->hid, kind, usb_hid_changed);
+    }
     if (us->display && us->hid.s) {
         qemu_input_handler_bind(us->hid.s, us->display, us->head, NULL);
     }
@@ -739,6 +869,14 @@ static void usb_mouse_realize(USBDevice *dev, Error **errp)
 static void usb_keyboard_realize(USBDevice *dev, Error **errp)
 {
     usb_hid_initfn(dev, HID_KEYBOARD, &desc_keyboard, &desc_keyboard2, errp);
+}
+
+static void usb_gamepad_realize(USBDevice *dev, Error **errp)
+{
+    USBHIDState *us = USB_HID(dev);
+
+    us->usb_version = 1;
+    usb_hid_initfn(dev, HID_GAMEPAD, &desc_gamepad, &desc_gamepad, errp);
 }
 
 static int usb_ptr_post_load(void *opaque, int version_id)
@@ -770,6 +908,17 @@ static const VMStateDescription vmstate_usb_kbd = {
     .fields = (const VMStateField[]) {
         VMSTATE_USB_DEVICE(dev, USBHIDState),
         VMSTATE_HID_KEYBOARD_DEVICE(hid, USBHIDState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_usb_gamepad = {
+    .name = "usb-gamepad",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_USB_DEVICE(dev, USBHIDState),
+        VMSTATE_HID_GAMEPAD_DEVICE(hid, USBHIDState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -865,6 +1014,29 @@ static const TypeInfo usb_keyboard_info = {
     .class_init    = usb_keyboard_class_initfn,
 };
 
+static Property usb_gamepad_properties[] = {
+        DEFINE_PROP_UINT32("index", USBHIDState, index, 0),
+        DEFINE_PROP_END_OF_LIST(),
+};
+
+static void usb_gamepad_class_initfn(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+
+    uc->realize      = usb_gamepad_realize;
+    uc->product_desc = "QEMU USB Gamepad";
+    dc->vmsd = &vmstate_usb_gamepad;
+    device_class_set_props(dc, usb_gamepad_properties);
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+}
+
+static const TypeInfo usb_gamepad_info = {
+    .name          = "usb-gamepad",
+    .parent        = TYPE_USB_HID,
+    .class_init    = usb_gamepad_class_initfn,
+};
+
 static void usb_hid_register_types(void)
 {
     type_register_static(&usb_hid_type_info);
@@ -874,6 +1046,7 @@ static void usb_hid_register_types(void)
     usb_legacy_register("usb-mouse", "mouse", NULL);
     type_register_static(&usb_keyboard_info);
     usb_legacy_register("usb-kbd", "keyboard", NULL);
+    type_register_static(&usb_gamepad_info);
 }
 
 type_init(usb_hid_register_types)

@@ -34,6 +34,8 @@
 #define HID_USAGE_POSTFAIL              0x02
 #define HID_USAGE_ERROR_UNDEFINED       0x03
 
+static HIDState *hid_gamepads[HID_GAMEPAD_MAX];
+
 /* Indices are QEMU keycodes, values are from HID Usage Table.  Indices
  * above 0x80 are for keys that come after 0xe0 or 0xe1+0x1d or 0xe1+0x9d.  */
 static const uint8_t hid_usage_keys[0x100] = {
@@ -482,6 +484,54 @@ int hid_keyboard_write(HIDState *hs, uint8_t *buf, int len)
     return 0;
 }
 
+int hid_gamepad_poll(HIDState *hs, uint8_t *buf, int len)
+{
+    const QemuGamepadState *state = &hs->gamepad.state;
+
+    hs->idle_pending = false;
+    hs->n = 0;
+    if (len < 11) {
+        return 0;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        uint16_t axis = state->axis[i];
+
+        buf[i * 2] = axis & 0xff;
+        buf[i * 2 + 1] = axis >> 8;
+    }
+    buf[8] = state->hat & 0x0f;
+    buf[9] = state->buttons & 0xff;
+    buf[10] = state->buttons >> 8;
+    return 11;
+}
+
+void qemu_gamepad_update(uint32_t index, const QemuGamepadState *state)
+{
+    HIDState *hs;
+    QemuGamepadState next;
+
+    if (index >= HID_GAMEPAD_MAX || !state || !hid_gamepads[index]) {
+        return;
+    }
+
+    hs = hid_gamepads[index];
+    next = *state;
+    next.buttons &= 0x0fff;
+    if (next.hat > HID_GAMEPAD_HAT_NEUTRAL) {
+        next.hat = HID_GAMEPAD_HAT_NEUTRAL;
+    }
+    if (!memcmp(hs->gamepad.state.axis, next.axis, sizeof(next.axis)) &&
+        hs->gamepad.state.buttons == next.buttons &&
+        hs->gamepad.state.hat == next.hat) {
+        return;
+    }
+
+    hs->gamepad.state = next;
+    hs->n = 1;
+    hs->event(hs);
+}
+
 void hid_reset(HIDState *hs)
 {
     switch (hs->kind) {
@@ -495,6 +545,10 @@ void hid_reset(HIDState *hs)
     case HID_TABLET:
         memset(hs->ptr.queue, 0, sizeof(hs->ptr.queue));
         break;
+    case HID_GAMEPAD:
+        memset(&hs->gamepad.state, 0, sizeof(hs->gamepad.state));
+        hs->gamepad.state.hat = HID_GAMEPAD_HAT_NEUTRAL;
+        break;
     }
     hs->head = 0;
     hs->n = 0;
@@ -506,7 +560,14 @@ void hid_reset(HIDState *hs)
 
 void hid_free(HIDState *hs)
 {
-    qemu_input_handler_unregister(hs->s);
+    if (hs->kind == HID_GAMEPAD &&
+        hs->gamepad.index < HID_GAMEPAD_MAX &&
+        hid_gamepads[hs->gamepad.index] == hs) {
+        hid_gamepads[hs->gamepad.index] = NULL;
+    }
+    if (hs->s) {
+        qemu_input_handler_unregister(hs->s);
+    }
     hid_del_idle_timer(hs);
 }
 
@@ -546,6 +607,19 @@ void hid_init(HIDState *hs, int kind, HIDEventFunc event)
         hs->s = qemu_input_handler_register((DeviceState *)hs,
                                             &hid_tablet_handler);
     }
+}
+
+bool hid_gamepad_init(HIDState *hs, uint32_t index, HIDEventFunc event)
+{
+    if (index >= HID_GAMEPAD_MAX || hid_gamepads[index]) {
+        return false;
+    }
+
+    hid_init(hs, HID_GAMEPAD, event);
+    hs->gamepad.index = index;
+    hs->gamepad.state.hat = HID_GAMEPAD_HAT_NEUTRAL;
+    hid_gamepads[index] = hs;
+    return true;
 }
 
 static int hid_post_load(void *opaque, int version_id)
@@ -620,6 +694,21 @@ const VMStateDescription vmstate_hid_keyboard_device = {
         VMSTATE_UINT8_ARRAY(kbd.key, HIDState, 16),
         VMSTATE_INT32(kbd.keys, HIDState),
         VMSTATE_INT32(protocol, HIDState),
+        VMSTATE_UINT8(idle, HIDState),
+        VMSTATE_END_OF_LIST(),
+    }
+};
+
+const VMStateDescription vmstate_hid_gamepad_device = {
+    .name = "HIDGamepadDevice",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = hid_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT16_ARRAY(gamepad.state.axis, HIDState, 4),
+        VMSTATE_UINT16(gamepad.state.buttons, HIDState),
+        VMSTATE_UINT8(gamepad.state.hat, HIDState),
+        VMSTATE_UINT32(n, HIDState),
         VMSTATE_UINT8(idle, HIDState),
         VMSTATE_END_OF_LIST(),
     }

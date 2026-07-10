@@ -19,6 +19,7 @@
 #include "ui/console.h"
 #include "ui/kbd-state.h"
 #include "ui/libretro-vars.h"
+#include "hw/input/hid.h"
 #include "audio/audio.h"
 #include "audio/audio_int.h"
 #include "sysemu/block-backend.h"
@@ -81,6 +82,10 @@ static size_t num_pending_keys = 0;
 static int mouse_dx, mouse_dy;
 static int wheel_accum; // scroll detents, up positive
 static bool buttons_down[INPUT_BUTTON__MAX];
+static QemuGamepadState gamepad_state = {
+	.hat = HID_GAMEPAD_HAT_NEUTRAL,
+};
+static bool gamepad_port_enabled = true;
 static pthread_mutex_t input_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Injection bottom half; created on the emu thread once the console
 // exists, scheduled by retro_run after each poll (legal from any thread).
@@ -129,12 +134,17 @@ static const struct choice whpx_isolation_choices[] = {
 	{ "off (trusted guests only)", -1 },
 	{ NULL, 0 },
 };
+static const struct choice retropad_choices[] = {
+	{ "USB HID gamepad", 1 },
+	{ NULL, 0 },
+};
 static int opt_ram_mb;
 static char opt_boot_order_char;
 static const char *opt_accel; // "whpx"/"tcg" string literal, or NULL
 // 0 = auto/leave argv alone, 1 = secure isolation on, -1 = performance mode.
 static int opt_whpx_isolation;
 static int opt_audio_buffer_us;
+static int opt_retropad;
 static int mouse_speed_pct = 100;
 static int mouse_rem_x, mouse_rem_y; // sub-unit motion carry; retro_run only
 static unsigned restart_notified_mask; // frontend thread only
@@ -642,6 +652,66 @@ static void audio_callback(void)
 
 static retro_environment_t cb_env;
 
+static const struct retro_controller_description qemu_controller_types[] = {
+	{ .desc = "RetroPad", .id = RETRO_DEVICE_JOYPAD },
+	{ .desc = "Keyboard", .id = RETRO_DEVICE_KEYBOARD },
+};
+
+static const struct retro_controller_info qemu_controller_info[] = {
+	{
+		.types = qemu_controller_types,
+		.num_types = G_N_ELEMENTS(qemu_controller_types),
+	},
+	{ 0 },
+};
+
+#define PAD_DESC(_device, _index, _id, _description) \
+	{ 0, (_device), (_index), (_id), (_description) }
+static const struct retro_input_descriptor qemu_input_descriptors[] = {
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,
+		 "B / south (guest button 1)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,
+		 "A / east (guest button 2)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,
+		 "Y / west (guest button 3)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,
+		 "X / north (guest button 4)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,
+		 "L (guest button 5)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,
+		 "R (guest button 6)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,
+		 "L2 (guest button 7)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,
+		 "R2 (guest button 8)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT,
+		 "Select (guest button 9)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,
+		 "Start (guest button 10)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3,
+		 "L3 (guest button 11)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3,
+		 "R3 (guest button 12)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,
+		 "D-pad Up (guest POV)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,
+		 "D-pad Down (guest POV)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,
+		 "D-pad Left (guest POV)"),
+	PAD_DESC(RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT,
+		 "D-pad Right (guest POV)"),
+	PAD_DESC(RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+		 RETRO_DEVICE_ID_ANALOG_X, "Left analog X"),
+	PAD_DESC(RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+		 RETRO_DEVICE_ID_ANALOG_Y, "Left analog Y"),
+	PAD_DESC(RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+		 RETRO_DEVICE_ID_ANALOG_X, "Right analog X"),
+	PAD_DESC(RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+		 RETRO_DEVICE_ID_ANALOG_Y, "Right analog Y"),
+	{ 0 },
+};
+#undef PAD_DESC
+
 // v0 format: "Label; value|value|..." — first value is the default, and
 // the frontend UI shows the raw value strings, so they must read well on
 // their own. The frontend copies the array during the call.
@@ -653,6 +723,7 @@ static const struct retro_variable qemu_core_variables[] = {
 	{ "qemu_whpx_isolation",
 	  "WHPX security isolation (restart); auto|on|off (trusted guests only)" },
 	{ "qemu_audio_buffer", "Audio buffer (restart); auto|32 ms|48 ms|64 ms|128 ms" },
+	{ "qemu_retropad", "RetroPad device (restart); auto|USB HID gamepad" },
 	{ "qemu_mouse_speed", "Mouse speed; 100%|50%|75%|150%|200%" },
 #ifdef CONFIG_QEMU_3DFX
 	{ "qemu_3dfx_fps_limit",
@@ -672,15 +743,9 @@ void retro_set_environment(retro_environment_t cb)
 	cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK,
 	   &(struct retro_keyboard_callback){ keyboard_event });
 	cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO,
-	   (struct retro_controller_info[]){
-		   {
-			   .types = (struct retro_controller_description[]){ {
-				   .desc = "Keyboard",
-				   .id = RETRO_DEVICE_KEYBOARD,
-			   } },
-			   .num_types = 1,
-		   },
-		   { 0 } });
+	   (void *)qemu_controller_info);
+	cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS,
+	   (void *)qemu_input_descriptors);
 	cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir);
 	cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void *)qemu_core_variables);
 
@@ -714,6 +779,20 @@ void retro_set_input_state(retro_input_state_t cb)
 
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
+	if (port != 0) {
+		return;
+	}
+
+	pthread_mutex_lock(&input_mutex);
+	gamepad_port_enabled = device != RETRO_DEVICE_NONE;
+	if (!gamepad_port_enabled) {
+		memset(&gamepad_state, 0, sizeof(gamepad_state));
+		gamepad_state.hat = HID_GAMEPAD_HAT_NEUTRAL;
+	}
+	pthread_mutex_unlock(&input_mutex);
+	if (input_bh && !exited) {
+		CALL_QEMU_FUNC(qemu_bh_schedule, input_bh);
+	}
 }
 
 void retro_reset(void)
@@ -1041,6 +1120,7 @@ static void input_inject_bh(void *opaque)
 		[INPUT_BUTTON_MIDDLE] = 1u << INPUT_BUTTON_MIDDLE,
 	};
 	struct key_event keys[KEY_EVENT_QUEUE_LEN];
+	QemuGamepadState pad;
 	size_t nkeys;
 	uint32_t buttons_new = 0;
 	int dx, dy, wheel;
@@ -1055,12 +1135,14 @@ static void input_inject_bh(void *opaque)
 	mouse_dy = 0;
 	wheel = wheel_accum;
 	wheel_accum = 0;
+	pad = gamepad_state;
 	for (size_t i = 0; i < INPUT_BUTTON__MAX; i++) {
 		if (buttons_down[i]) {
 			buttons_new |= 1u << i;
 		}
 	}
 	pthread_mutex_unlock(&input_mutex);
+	CALL_QEMU_FUNC(qemu_gamepad_update, 0, &pad);
 
 	bool changed = nkeys || dx || dy || wheel || buttons_new != buttons_old;
 
@@ -1338,6 +1420,8 @@ static void update_variables(bool first_load)
 					  get_var("qemu_whpx_isolation"));
 	int abuf = parse_choice(audio_buffer_choices,
 				get_var("qemu_audio_buffer"));
+	int retropad = parse_choice(retropad_choices,
+				    get_var("qemu_retropad"));
 
 	if (first_load) {
 		opt_ram_mb = ram;
@@ -1345,6 +1429,7 @@ static void update_variables(bool first_load)
 		opt_accel = accel;
 		opt_whpx_isolation = whpx_isolation;
 		opt_audio_buffer_us = abuf;
+		opt_retropad = retropad;
 	} else {
 		const struct {
 			bool changed;
@@ -1358,6 +1443,7 @@ static void update_variables(bool first_load)
 			{ whpx_isolation != opt_whpx_isolation,
 			  "WHPX security isolation" },
 			{ abuf != opt_audio_buffer_us, "Audio buffer" },
+			{ retropad != opt_retropad, "RetroPad device" },
 		};
 		for (size_t i = 0; i < G_N_ELEMENTS(boot_opts); i++) {
 			if (!boot_opts[i].changed) {
@@ -1420,6 +1506,55 @@ static void args_remove_all(GPtrArray *args, const char *flag)
 				  1;
 		g_ptr_array_remove_range(args, i, n);
 	}
+}
+
+static void args_add_flag(GPtrArray *args, const char *flag)
+{
+	if (args_find(args, flag) < 0) {
+		g_ptr_array_add(args, g_strdup(flag));
+	}
+}
+
+static bool args_has_gamepad_zero(GPtrArray *args)
+{
+	for (guint i = 0; i + 1 < args->len; i++) {
+		if (strcmp(args->pdata[i], "-device") != 0) {
+			continue;
+		}
+		char **parts = g_strsplit(args->pdata[i + 1], ",", -1);
+		bool gamepad = !strcmp(parts[0], "usb-gamepad");
+		unsigned index = 0;
+		bool valid_index = true;
+
+		for (char **p = parts + 1; gamepad && *p; p++) {
+			if (g_str_has_prefix(*p, "index=")) {
+				char *end = NULL;
+				unsigned long parsed = g_ascii_strtoull(
+					*p + strlen("index="), &end, 10);
+				valid_index = end && !*end &&
+					      parsed <= G_MAXUINT;
+				if (valid_index) {
+					index = parsed;
+				}
+			}
+		}
+		g_strfreev(parts);
+		if (gamepad && valid_index && index == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool args_target_is_x86(GPtrArray *args)
+{
+	if (!args->len ||
+	    !g_str_has_prefix(args->pdata[0], QEMU_CMD_PREFIX)) {
+		return false;
+	}
+	const char *arch = (char *)args->pdata[0] + strlen(QEMU_CMD_PREFIX);
+
+	return !strcmp(arch, "x86_64") || !strcmp(arch, "i386");
 }
 
 // Rewrite out.buffer-length on the libretro audiodev's option string.
@@ -1519,6 +1654,19 @@ static void apply_option_overrides(GPtrArray *args)
 	}
 	if (opt_audio_buffer_us) {
 		apply_audio_buffer(args, opt_audio_buffer_us);
+	}
+	if (opt_retropad) {
+		if (!args_target_is_x86(args)) {
+			notice_report(
+				"USB HID gamepad option ignored: only x86 PC guests are supported");
+		} else {
+			args_add_flag(args, "-usb");
+			if (!args_has_gamepad_zero(args)) {
+				g_ptr_array_add(args, g_strdup("-device"));
+				g_ptr_array_add(args,
+						g_strdup("usb-gamepad,index=0"));
+			}
+		}
 	}
 }
 
@@ -1976,6 +2124,10 @@ bool retro_load_game(const struct retro_game_info *game)
 	if (!game) {
 		return false;
 	}
+	pthread_mutex_lock(&input_mutex);
+	memset(&gamepad_state, 0, sizeof(gamepad_state));
+	gamepad_state.hat = HID_GAMEPAD_HAT_NEUTRAL;
+	pthread_mutex_unlock(&input_mutex);
 
 	// Fresh disk-control state; statics persist across load cycles
 	// and the previous emu thread (if any) is already joined.
@@ -2095,6 +2247,13 @@ bool retro_load_game_special(unsigned game_type,
 
 void retro_unload_game(void)
 {
+	pthread_mutex_lock(&input_mutex);
+	memset(&gamepad_state, 0, sizeof(gamepad_state));
+	gamepad_state.hat = HID_GAMEPAD_HAT_NEUTRAL;
+	pthread_mutex_unlock(&input_mutex);
+	if (input_bh && !exited) {
+		CALL_QEMU_FUNC(qemu_bh_schedule, input_bh);
+	}
 	// target_arch is set by the emu thread just before QEMU starts; if
 	// it's still NULL there is no QEMU instance to ask for shutdown (and
 	// the per-target dispatch can't handle NULL).
@@ -2133,6 +2292,81 @@ static int scale_mouse(int d, int *rem)
 	return out;
 }
 
+static uint8_t retropad_hat(bool up, bool down, bool left, bool right)
+{
+	static const uint8_t hats[3][3] = {
+		{ 7, 0, 1 },
+		{ 6, HID_GAMEPAD_HAT_NEUTRAL, 2 },
+		{ 5, 4, 3 },
+	};
+	int x = (right && !left) - (left && !right);
+	int y = (down && !up) - (up && !down);
+
+	return hats[y + 1][x + 1];
+}
+
+static QemuGamepadState sample_retropad(void)
+{
+	static const struct {
+		unsigned retro_id;
+		unsigned hid_button;
+	} button_map[] = {
+		{ RETRO_DEVICE_ID_JOYPAD_B, 0 },
+		{ RETRO_DEVICE_ID_JOYPAD_A, 1 },
+		{ RETRO_DEVICE_ID_JOYPAD_Y, 2 },
+		{ RETRO_DEVICE_ID_JOYPAD_X, 3 },
+		{ RETRO_DEVICE_ID_JOYPAD_L, 4 },
+		{ RETRO_DEVICE_ID_JOYPAD_R, 5 },
+		{ RETRO_DEVICE_ID_JOYPAD_L2, 6 },
+		{ RETRO_DEVICE_ID_JOYPAD_R2, 7 },
+		{ RETRO_DEVICE_ID_JOYPAD_SELECT, 8 },
+		{ RETRO_DEVICE_ID_JOYPAD_START, 9 },
+		{ RETRO_DEVICE_ID_JOYPAD_L3, 10 },
+		{ RETRO_DEVICE_ID_JOYPAD_R3, 11 },
+	};
+	QemuGamepadState state = {
+		.hat = HID_GAMEPAD_HAT_NEUTRAL,
+	};
+	bool enabled;
+
+	pthread_mutex_lock(&input_mutex);
+	enabled = gamepad_port_enabled;
+	pthread_mutex_unlock(&input_mutex);
+	if (!enabled) {
+		return state;
+	}
+
+	for (size_t i = 0; i < G_N_ELEMENTS(button_map); i++) {
+		if (cb_input_state(0, RETRO_DEVICE_JOYPAD, 0,
+				   button_map[i].retro_id)) {
+			state.buttons |= 1u << button_map[i].hid_button;
+		}
+	}
+	bool up = cb_input_state(0, RETRO_DEVICE_JOYPAD, 0,
+				 RETRO_DEVICE_ID_JOYPAD_UP);
+	bool down = cb_input_state(0, RETRO_DEVICE_JOYPAD, 0,
+				   RETRO_DEVICE_ID_JOYPAD_DOWN);
+	bool left = cb_input_state(0, RETRO_DEVICE_JOYPAD, 0,
+				   RETRO_DEVICE_ID_JOYPAD_LEFT);
+	bool right = cb_input_state(0, RETRO_DEVICE_JOYPAD, 0,
+				    RETRO_DEVICE_ID_JOYPAD_RIGHT);
+
+	state.hat = retropad_hat(up, down, left, right);
+	state.axis[0] = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				       RETRO_DEVICE_INDEX_ANALOG_LEFT,
+				       RETRO_DEVICE_ID_ANALOG_X);
+	state.axis[1] = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				       RETRO_DEVICE_INDEX_ANALOG_LEFT,
+				       RETRO_DEVICE_ID_ANALOG_Y);
+	state.axis[2] = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				       RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+				       RETRO_DEVICE_ID_ANALOG_X);
+	state.axis[3] = cb_input_state(0, RETRO_DEVICE_ANALOG,
+				       RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+				       RETRO_DEVICE_ID_ANALOG_Y);
+	return state;
+}
+
 void retro_run(void)
 {
 #ifdef CONFIG_QEMU_3DFX
@@ -2154,6 +2388,7 @@ void retro_run(void)
 
 	// Sample all input into locals first — a frontend is free to do
 	// arbitrary work inside input_state, so no lock is held across it.
+	QemuGamepadState pad = sample_retropad();
 	int dx = cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
 				RETRO_DEVICE_ID_MOUSE_X);
 	int dy = cb_input_state(0, RETRO_DEVICE_MOUSE, 0,
@@ -2191,6 +2426,7 @@ void retro_run(void)
 	mouse_dx += scale_mouse(dx, &mouse_rem_x);
 	mouse_dy += scale_mouse(dy, &mouse_rem_y);
 	memcpy(buttons_down, btn, sizeof(buttons_down));
+	gamepad_state = pad;
 	wheel_accum += wheel;
 
 	// Emit key transitions in three passes — modifier presses first,
