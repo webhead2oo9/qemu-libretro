@@ -82,6 +82,7 @@ static struct {
     int64_t frontend_last_seen_us;
     bool frontend_idle;
     bool smp_error_reported;
+    bool geometry_error_reported;
     bool pbo_broken;            /* no PBO support, or it errored: stay
                                  * on the synchronous path for good */
     void (WINAPI *glReadPixels)(int, int, int, int, unsigned, unsigned,
@@ -102,6 +103,7 @@ void qemu_fx_register_sink(const QemuFxSink *sink)
 {
     fx.sink = sink;
     fx.smp_error_reported = false;
+    fx.geometry_error_reported = false;
 }
 
 static bool fx_gl_resolve(void)
@@ -152,6 +154,19 @@ static void fx_guest_dims(int *w, int *h)
 static bool fx_window_create(int w, int h)
 {
     static const char class_name[] = "qemu-3dfx-libretro";
+
+    if (w <= 0 || h <= 0 || w > QEMU_FX_MAX_WIDTH ||
+        h > QEMU_FX_MAX_HEIGHT) {
+        if (!fx.geometry_error_reported) {
+            error_report("qemu-3dfx resolution %dx%d is outside the safe "
+                         "range 1x1 through %dx%d. The VM was paused before "
+                         "allocating host graphics resources",
+                         w, h, QEMU_FX_MAX_WIDTH, QEMU_FX_MAX_HEIGHT);
+            fx.geometry_error_reported = true;
+        }
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+        return false;
+    }
 
     if (!fx.class_registered) {
         WNDCLASSA wc = {

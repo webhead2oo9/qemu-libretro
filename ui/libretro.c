@@ -34,6 +34,9 @@
 
 void rcu_init(void);
 
+G_GNUC_PRINTF(1, 2)
+static void notice_report(const char *fmt, ...);
+
 static const char *game_path;
 static const char *system_dir;
 static const char *target_arch;
@@ -904,6 +907,15 @@ static void refresh(DisplayChangeListener *dcl)
 // thread) and BGRA bytes already match XRGB8888.
 static void fx_sink_publish(const void *pixels, int w, int h)
 {
+	/* ui/libretro-3dfx.c validates before creating its window/PBOs. Keep
+	 * this boundary defensive: never size a frontend buffer from unchecked
+	 * dimensions if another producer is added later. */
+	if (w <= 0 || h <= 0 || w > QEMU_FX_MAX_WIDTH ||
+	    h > QEMU_FX_MAX_HEIGHT) {
+		notice_report("qemu-3dfx rejected unsafe frame size %dx%d", w, h);
+		return;
+	}
+
 	pthread_mutex_lock(&frame_mutex);
 	pending_ensure(w, h);
 	memcpy(pending_frame.buf, pixels, (size_t)w * h * 4);
@@ -912,10 +924,22 @@ static void fx_sink_publish(const void *pixels, int w, int h)
 	pthread_mutex_unlock(&frame_mutex);
 
 	pthread_mutex_lock(&av_info_lock);
+	bool geometry_changed = false;
+	if (av_info.geometry.max_width < (unsigned)w) {
+		av_info.geometry.max_width = w;
+		geometry_changed = true;
+	}
+	if (av_info.geometry.max_height < (unsigned)h) {
+		av_info.geometry.max_height = h;
+		geometry_changed = true;
+	}
 	if (av_info.geometry.base_width != w ||
 	    av_info.geometry.base_height != h) {
 		av_info.geometry.base_width = w;
 		av_info.geometry.base_height = h;
+		geometry_changed = true;
+	}
+	if (geometry_changed) {
 		changed_geometry = true;
 	}
 	pthread_mutex_unlock(&av_info_lock);

@@ -281,6 +281,10 @@ not in the RetroArch folder:
   from different host threads. The core pauses before 3D activation and shows
   an error when `-smp` permits more than one CPU; remove `-smp` or use
   `-smp 1`, then restart the content. Non-3D VMs are unaffected.
+- 3D modes can grow the frontend geometry dynamically through 3840x2160. A
+  larger or invalid mode is rejected before creating a host window or capture
+  buffers, and the VM pauses with an error instead of clipping the frame or
+  allocating an arbitrary guest-selected amount of host memory.
 - Save states are unreliable while 3D pass-through is active.
 
 ## Examples

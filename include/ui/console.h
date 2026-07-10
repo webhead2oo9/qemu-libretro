@@ -471,6 +471,9 @@ bool vnc_display_update(DisplayUpdateOptionsVNC *arg, Error **errp);
 int index_from_key(const char *key, size_t key_length);
 
 #ifdef CONFIG_QEMU_3DFX
+#define QEMU_FX_MAX_WIDTH  3840
+#define QEMU_FX_MAX_HEIGHT 2160
+
 /*
  * qemu-3dfx display glue, implemented by ui/libretro-3dfx.c in this fork
  * (upstream qemu-3dfx implements these in ui/sdl2.c).
