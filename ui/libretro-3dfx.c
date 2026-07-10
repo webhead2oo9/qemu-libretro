@@ -161,9 +161,23 @@ static bool fx_window_create(int w, int h)
             .lpszClassName = class_name,
         };
         if (!RegisterClassA(&wc)) {
-            warn_report("qemu-3dfx: RegisterClass failed (0x%lx)",
-                        GetLastError());
-            return false;
+            DWORD error = GetLastError();
+            WNDCLASSA existing = { 0 };
+
+            /* The class is owned by the frontend EXE, so it survives
+             * FreeLibrary/reload of this core DLL. Its window procedure is
+             * user32's DefWindowProc, not unloaded core code: reuse it after
+             * validating the GL-critical properties instead of making the
+             * second in-process 3D session fail. */
+            if (error != ERROR_CLASS_ALREADY_EXISTS ||
+                !GetClassInfoA(wc.hInstance, class_name, &existing) ||
+                existing.lpfnWndProc != DefWindowProcA ||
+                !(existing.style & CS_OWNDC)) {
+                warn_report("qemu-3dfx: incompatible window class "
+                            "'%s' (RegisterClass error 0x%lx)",
+                            class_name, error);
+                return false;
+            }
         }
         fx.class_registered = true;
     }
