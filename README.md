@@ -271,7 +271,11 @@ not in the RetroArch folder:
 
 ### Limitations
 
-- The asynchronous readback adds one frame of display latency.
+- 3D capture normally adds about one buffer swap of display latency. The core
+  never waits for a busy GPU: it presents the newest completed readback and
+  drops stale ones, so latency can increase temporarily under heavy GPU load
+  instead of stalling guest execution and audio. Capture also stops while the
+  frontend is not calling `retro_run` and resumes with a current frame.
 - Save states are unreliable while 3D pass-through is active.
 
 ## Examples
