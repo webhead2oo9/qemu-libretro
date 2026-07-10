@@ -50,6 +50,7 @@
 
 #define FX_PBO_LEGACY_COUNT 2
 #define FX_PBO_FENCED_COUNT 3
+#define FX_FRONTEND_IDLE_US 100000
 
 /* Capture at most every 8 ms: uncapped guests (the swap interval is
  * forced to 0) can swap far faster than the frontend's ~60 Hz present,
@@ -70,11 +71,15 @@ static struct {
     void *pbo_fence[FX_PBO_FENCED_COUNT];
     uint64_t pbo_sequence[FX_PBO_FENCED_COUNT];
     uint64_t next_sequence;
+    uint64_t min_publish_sequence;
     size_t pbo_size;
     int pbo_count;
     int pbo_index;              /* legacy path's next readback target */
     bool pbo_filled[FX_PBO_LEGACY_COUNT];
     bool sync_available;
+    uint32_t frontend_frame_count;
+    int64_t frontend_last_seen_us;
+    bool frontend_idle;
     bool pbo_broken;            /* no PBO support, or it errored: stay
                                  * on the synchronous path for good */
     void (WINAPI *glReadPixels)(int, int, int, int, unsigned, unsigned,
@@ -197,7 +202,11 @@ static void fx_window_destroy(void)
     fx.pbo_filled[0] = false;
     fx.pbo_filled[1] = false;
     fx.next_sequence = 0;
+    fx.min_publish_sequence = 0;
     fx.last_capture_us = 0;
+    fx.frontend_frame_count = 0;
+    fx.frontend_last_seen_us = 0;
+    fx.frontend_idle = false;
     fx_gl_forget_context();
     /* zero pub geometry: the first frame in a new window must publish
      * immediately, however recently the old window published */
@@ -257,6 +266,54 @@ static bool fx_pbo_resolve(void)
            fx.glMapBuffer && fx.glUnmapBuffer;
 }
 
+/* QEMU continues running when a libretro frontend pauses its retro_run calls.
+ * Stop GPU readback after a short grace period, but leave guest execution and
+ * audio alone. A wrapping counter avoids a cross-thread timestamp dependency. */
+static bool fx_frontend_wants_capture(int64_t now, bool *resumed)
+{
+    uint32_t count;
+
+    if (!fx.sink || !fx.sink->get_frontend_frame_count) {
+        return true;
+    }
+
+    count = fx.sink->get_frontend_frame_count();
+    if (count != fx.frontend_frame_count) {
+        fx.frontend_frame_count = count;
+        fx.frontend_last_seen_us = now;
+        if (fx.frontend_idle) {
+            fx.frontend_idle = false;
+            fx.min_publish_sequence = fx.next_sequence + 1;
+            fx.pbo_index = 0;
+            fx.pbo_filled[0] = false;
+            fx.pbo_filled[1] = false;
+            *resumed = true;
+            trace_libretro_3dfx_readback("frontend-resume",
+                                         fx.width, fx.height);
+        }
+        return true;
+    }
+
+    if (!fx.frontend_last_seen_us) {
+        fx.frontend_last_seen_us = now;
+        return true;
+    }
+    if (now - fx.frontend_last_seen_us <= FX_FRONTEND_IDLE_US) {
+        return true;
+    }
+
+    if (!fx.frontend_idle) {
+        fx.frontend_idle = true;
+        fx.min_publish_sequence = fx.next_sequence + 1;
+        fx.pbo_index = 0;
+        fx.pbo_filled[0] = false;
+        fx.pbo_filled[1] = false;
+        trace_libretro_3dfx_readback("frontend-idle",
+                                     fx.width, fx.height);
+    }
+    return false;
+}
+
 static void fx_pbo_clear_fences(void)
 {
     if (fx.glDeleteSync) {
@@ -310,6 +367,7 @@ static bool fx_pbo_ready(size_t size)
         fx.pbo_size = size;
         fx.pbo_index = 0;
         fx.next_sequence = 0;
+        fx.min_publish_sequence = 0;
     }
     return true;
 }
@@ -384,7 +442,8 @@ static bool fx_pbo_fenced_readback(bool *published)
         if (status == FX_GL_ALREADY_SIGNALED ||
             status == FX_GL_CONDITION_SATISFIED) {
             ready[i] = true;
-            if (newest < 0 || fx.pbo_sequence[i] > newest_sequence) {
+            if (fx.pbo_sequence[i] >= fx.min_publish_sequence &&
+                (newest < 0 || fx.pbo_sequence[i] > newest_sequence)) {
                 newest = i;
                 newest_sequence = fx.pbo_sequence[i];
             }
@@ -449,6 +508,12 @@ static void fx_swap_readback(void)
         !fx.sink || !fx.sink->publish) {
         return;
     }
+    int64_t now = g_get_monotonic_time();
+    bool resumed = false;
+
+    if (!fx_frontend_wants_capture(now, &resumed)) {
+        return;
+    }
     if (!fx.glReadPixels && !fx_gl_resolve()) {
         return;
     }
@@ -457,9 +522,9 @@ static void fx_swap_readback(void)
      * presents only burns vCPU time under the BQL. Never skip after a
      * geometry change — the frontend re-inits its video driver to
      * black on those and needs a real frame at the new size. */
-    int64_t now = g_get_monotonic_time();
     bool resized = fx.width != fx.pub_width || fx.height != fx.pub_height;
-    if (!resized && now - fx.last_capture_us < FX_CAPTURE_MIN_US) {
+    bool force_sync = resized || resumed;
+    if (!force_sync && now - fx.last_capture_us < FX_CAPTURE_MIN_US) {
         return;
     }
     fx.last_capture_us = now;
@@ -474,10 +539,9 @@ static void fx_swap_readback(void)
 
     /* The fenced three-buffer path maps only transfers the GPU reports
      * complete. Drivers without sync objects retain the old two-PBO
-     * fallback. The first frame at a new size takes the synchronous
-     * path below instead — it must reach the frontend now, not one
-     * swap later. */
-    if (!fx.pbo_broken && !resized && fx_pbo_ready(size)) {
+     * fallback. After a size change or resume, the synchronous path below
+     * supplies a current frame immediately instead of one swap later. */
+    if (!fx.pbo_broken && !force_sync && fx_pbo_ready(size)) {
         if (fx.sync_available) {
             async_done = fx_pbo_fenced_readback(&published);
         } else {
@@ -486,8 +550,8 @@ static void fx_swap_readback(void)
     }
 
     if (!async_done && !published) {
-        /* Synchronous path: PBO-less or erroring drivers, and the
-         * first frame after a geometry change. */
+        /* Synchronous path: PBO-less or erroring drivers, and the first
+         * frame after a geometry change or frontend resume. */
         if (!fx.readback) {
             fx.readback = g_malloc(size);
         }

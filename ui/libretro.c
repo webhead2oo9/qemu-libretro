@@ -9,6 +9,7 @@
 #include "retro-gen.h"
 #include "qemu/datadir.h"
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qemu/module.h"
 #include "qemu/main-loop.h"
 #include "qemu/error-report.h"
@@ -203,6 +204,11 @@ static bool present_valid = false;	// frontend thread only
 // stands down so the stale surface cannot overwrite them. Written and
 // read under the BQL only.
 static bool fx_active;
+#ifdef CONFIG_QEMU_3DFX
+/* retro_run heartbeat: incremented by the frontend thread and sampled by
+ * the 3D readback thread so capture can stop while the frontend is idle. */
+static uint32_t frontend_frame_count;
+#endif
 
 // Size the pending slot for a w-by-h XRGB8888 frame; frame_mutex held.
 // Buffers are only ever reallocated, never freed: the present slot may
@@ -949,10 +955,16 @@ static void fx_sink_guest_dims(int *w, int *h)
 	}
 }
 
+static uint32_t fx_sink_frontend_frame_count(void)
+{
+	return qatomic_read(&frontend_frame_count);
+}
+
 static const QemuFxSink fx_sink = {
 	.publish = fx_sink_publish,
 	.set_active = fx_sink_set_active,
 	.get_guest_dims = fx_sink_guest_dims,
+	.get_frontend_frame_count = fx_sink_frontend_frame_count,
 };
 #endif
 
@@ -2133,6 +2145,9 @@ static void pad_probe(void)
 
 void retro_run(void)
 {
+#ifdef CONFIG_QEMU_3DFX
+	qatomic_inc(&frontend_frame_count);
+#endif
 	// Last keyboard state this thread saw; used for edge detection
 	// against the polled state below. Frontend thread only.
 	static bool key_down_prev[RETROK_LAST];

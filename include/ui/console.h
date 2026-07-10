@@ -507,6 +507,8 @@ typedef struct QemuFxSink {
     void (*set_active)(bool on);
     /* current guest display size, for sizing the context window */
     void (*get_guest_dims)(int *width, int *height);
+    /* monotonically wrapping retro_run count; safe to read cross-thread */
+    uint32_t (*get_frontend_frame_count)(void);
 } QemuFxSink;
 void qemu_fx_register_sink(const QemuFxSink *sink);
 #endif /* CONFIG_QEMU_3DFX */
