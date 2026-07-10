@@ -42,10 +42,19 @@
 #define FX_GL_STREAM_READ       0x88E1
 #define FX_GL_READ_ONLY         0x88B8
 
-/* Publish at most every 8 ms: uncapped guests (the swap interval is
+/* GL_ARB_sync subset. GLsync is an opaque pointer-sized handle. */
+#define FX_GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define FX_GL_ALREADY_SIGNALED           0x911A
+#define FX_GL_TIMEOUT_EXPIRED            0x911B
+#define FX_GL_CONDITION_SATISFIED        0x911C
+
+#define FX_PBO_LEGACY_COUNT 2
+#define FX_PBO_FENCED_COUNT 3
+
+/* Capture at most every 8 ms: uncapped guests (the swap interval is
  * forced to 0) can swap far faster than the frontend's ~60 Hz present,
  * and every readback stalls a vCPU that holds the BQL. */
-#define FX_PUBLISH_MIN_US 8000
+#define FX_CAPTURE_MIN_US 8000
 
 static struct {
     const QemuFxSink *sink;
@@ -55,12 +64,17 @@ static struct {
     uint32_t glide_res;      /* packed ((h & 0x7FFF) << 16) | w */
     bool glide_ready;
     void *readback;
-    int64_t last_publish_us;
+    int64_t last_capture_us;
     int pub_width, pub_height;  /* geometry of the last published frame */
-    unsigned pbo[2];            /* names live in the window's GL context */
+    unsigned pbo[FX_PBO_FENCED_COUNT]; /* current-context object names */
+    void *pbo_fence[FX_PBO_FENCED_COUNT];
+    uint64_t pbo_sequence[FX_PBO_FENCED_COUNT];
+    uint64_t next_sequence;
     size_t pbo_size;
-    int pbo_index;              /* PBO the next readback goes into */
-    bool pbo_filled[2];
+    int pbo_count;
+    int pbo_index;              /* legacy path's next readback target */
+    bool pbo_filled[FX_PBO_LEGACY_COUNT];
+    bool sync_available;
     bool pbo_broken;            /* no PBO support, or it errored: stay
                                  * on the synchronous path for good */
     void (WINAPI *glReadPixels)(int, int, int, int, unsigned, unsigned,
@@ -73,6 +87,9 @@ static struct {
                                 unsigned);
     void *(WINAPI *glMapBuffer)(unsigned, unsigned);
     unsigned char (WINAPI *glUnmapBuffer)(unsigned);
+    void *(WINAPI *glFenceSync)(unsigned, unsigned);
+    unsigned (WINAPI *glClientWaitSync)(void *, unsigned, uint64_t);
+    void (WINAPI *glDeleteSync)(void *);
 } fx;
 
 void qemu_fx_register_sink(const QemuFxSink *sink)
@@ -107,6 +124,10 @@ static void fx_gl_forget_context(void)
     fx.glBufferData = NULL;
     fx.glMapBuffer = NULL;
     fx.glUnmapBuffer = NULL;
+    fx.glFenceSync = NULL;
+    fx.glClientWaitSync = NULL;
+    fx.glDeleteSync = NULL;
+    fx.sync_available = false;
     fx.pbo_broken = false;
 }
 
@@ -167,12 +188,16 @@ static void fx_window_destroy(void)
     fx.height = 0;
     /* The GL context that owned the PBOs dies with the window; forget
      * its object names and retry capability resolution in the next one. */
-    fx.pbo[0] = 0;
-    fx.pbo[1] = 0;
+    memset(fx.pbo, 0, sizeof(fx.pbo));
+    memset(fx.pbo_fence, 0, sizeof(fx.pbo_fence));
+    memset(fx.pbo_sequence, 0, sizeof(fx.pbo_sequence));
     fx.pbo_size = 0;
+    fx.pbo_count = 0;
     fx.pbo_index = 0;
     fx.pbo_filled[0] = false;
     fx.pbo_filled[1] = false;
+    fx.next_sequence = 0;
+    fx.last_capture_us = 0;
     fx_gl_forget_context();
     /* zero pub geometry: the first frame in a new window must publish
      * immediately, however recently the old window published */
@@ -222,13 +247,39 @@ static bool fx_pbo_resolve(void)
     FX_RESOLVE(glBufferData);
     FX_RESOLVE(glMapBuffer);
     FX_RESOLVE(glUnmapBuffer);
+    FX_RESOLVE(glFenceSync);
+    FX_RESOLVE(glClientWaitSync);
+    FX_RESOLVE(glDeleteSync);
 #undef FX_RESOLVE
+    fx.sync_available = fx.glFenceSync && fx.glClientWaitSync &&
+                        fx.glDeleteSync;
     return fx.glGenBuffers && fx.glBindBuffer && fx.glBufferData &&
            fx.glMapBuffer && fx.glUnmapBuffer;
 }
 
-/* Have both PBOs exist at the right size; sets pbo_broken when the
- * driver has no PBO entry points at all. */
+static void fx_pbo_clear_fences(void)
+{
+    if (fx.glDeleteSync) {
+        for (int i = 0; i < fx.pbo_count; i++) {
+            if (fx.pbo_fence[i]) {
+                fx.glDeleteSync(fx.pbo_fence[i]);
+            }
+        }
+    }
+    memset(fx.pbo_fence, 0, sizeof(fx.pbo_fence));
+    memset(fx.pbo_sequence, 0, sizeof(fx.pbo_sequence));
+}
+
+static void fx_pbo_fail(void)
+{
+    fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, 0);
+    fx_pbo_clear_fences();
+    fx.pbo_broken = true;
+    warn_report_once("qemu-3dfx: PBO readback failed; using "
+                     "synchronous readback");
+}
+
+/* Have the current context's PBO ring exist at the right size. */
 static bool fx_pbo_ready(size_t size)
 {
     if (!fx.glGenBuffers && !fx_pbo_resolve()) {
@@ -236,19 +287,159 @@ static bool fx_pbo_ready(size_t size)
         return false;
     }
     if (!fx.pbo[0]) {
-        fx.glGenBuffers(2, fx.pbo);
+        fx.pbo_count = fx.sync_available ? FX_PBO_FENCED_COUNT :
+                                          FX_PBO_LEGACY_COUNT;
+        fx.glGenBuffers(fx.pbo_count, fx.pbo);
+        for (int i = 0; i < fx.pbo_count; i++) {
+            if (!fx.pbo[i]) {
+                fx.pbo_broken = true;
+                return false;
+            }
+        }
         fx.pbo_size = 0;
     }
     if (fx.pbo_size != size) {
-        for (int i = 0; i < 2; i++) {
+        fx_pbo_clear_fences();
+        for (int i = 0; i < fx.pbo_count; i++) {
             fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[i]);
             fx.glBufferData(FX_GL_PIXEL_PACK_BUFFER, size, NULL,
                             FX_GL_STREAM_READ);
-            fx.pbo_filled[i] = false;
         }
+        fx.pbo_filled[0] = false;
+        fx.pbo_filled[1] = false;
         fx.pbo_size = size;
         fx.pbo_index = 0;
+        fx.next_sequence = 0;
     }
+    return true;
+}
+
+/* The fence has already reported completion, so mapping must not wait for
+ * the GPU. publish() copies the mapped bytes before this function unmaps. */
+static bool fx_pbo_publish(int index, const char *event, bool *published)
+{
+    fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[index]);
+    int64_t map_start = g_get_monotonic_time();
+    void *p = fx.glMapBuffer(FX_GL_PIXEL_PACK_BUFFER, FX_GL_READ_ONLY);
+
+    trace_libretro_3dfx_map(fx.width, fx.height,
+                            g_get_monotonic_time() - map_start);
+    if (!p) {
+        return false;
+    }
+
+    /* Rows are bottom-up; the frontend flips on present. */
+    fx.sink->publish(p, fx.width, fx.height);
+    trace_libretro_3dfx_readback(event, fx.width, fx.height);
+    *published = true;
+    return fx.glUnmapBuffer(FX_GL_PIXEL_PACK_BUFFER) != 0;
+}
+
+/* Compatibility path for drivers that expose PBOs but not GL_ARB_sync.
+ * This preserves the previous two-buffer behavior, including its possible
+ * map wait, rather than dropping PBO acceleration on older wrappers. */
+static bool fx_pbo_legacy_readback(bool *published)
+{
+    int cur = fx.pbo_index;
+    int prev = cur ^ 1;
+
+    fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[cur]);
+    fx.glReadPixels(0, 0, fx.width, fx.height,
+                    FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, NULL);
+    trace_libretro_3dfx_readback("pbo-kick-legacy", fx.width, fx.height);
+
+    if (fx.pbo_filled[prev] &&
+        !fx_pbo_publish(prev, "pbo-publish-legacy", published)) {
+        fx_pbo_fail();
+        return false;
+    }
+
+    fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, 0);
+    if (fx.glGetError() != FX_GL_NO_ERROR) {
+        fx_pbo_fail();
+        return false;
+    }
+
+    fx.pbo_filled[cur] = true;
+    fx.pbo_index = prev;
+    return true;
+}
+
+/* Poll every fence with a zero timeout and publish only the newest completed
+ * transfer. Older completed frames are discarded, and a full ring skips the
+ * next capture; neither condition is allowed to turn into a vCPU wait. */
+static bool fx_pbo_fenced_readback(bool *published)
+{
+    bool ready[FX_PBO_FENCED_COUNT] = { false };
+    int newest = -1;
+    uint64_t newest_sequence = 0;
+
+    for (int i = 0; i < fx.pbo_count; i++) {
+        unsigned status;
+
+        if (!fx.pbo_fence[i]) {
+            continue;
+        }
+        status = fx.glClientWaitSync(fx.pbo_fence[i], 0, 0);
+        if (status == FX_GL_ALREADY_SIGNALED ||
+            status == FX_GL_CONDITION_SATISFIED) {
+            ready[i] = true;
+            if (newest < 0 || fx.pbo_sequence[i] > newest_sequence) {
+                newest = i;
+                newest_sequence = fx.pbo_sequence[i];
+            }
+        } else if (status != FX_GL_TIMEOUT_EXPIRED) {
+            trace_libretro_3dfx_readback("pbo-wait-failed",
+                                         fx.width, fx.height);
+            fx_pbo_fail();
+            return false;
+        }
+    }
+
+    for (int i = 0; i < fx.pbo_count; i++) {
+        if (!ready[i] || i == newest) {
+            continue;
+        }
+        fx.glDeleteSync(fx.pbo_fence[i]);
+        fx.pbo_fence[i] = NULL;
+        fx.pbo_sequence[i] = 0;
+        trace_libretro_3dfx_readback("pbo-discard", fx.width, fx.height);
+    }
+
+    if (newest >= 0) {
+        bool ok = fx_pbo_publish(newest, "pbo-publish", published);
+
+        fx.glDeleteSync(fx.pbo_fence[newest]);
+        fx.pbo_fence[newest] = NULL;
+        fx.pbo_sequence[newest] = 0;
+        if (!ok) {
+            fx_pbo_fail();
+            return false;
+        }
+    }
+
+    for (int i = 0; i < fx.pbo_count; i++) {
+        if (fx.pbo_fence[i]) {
+            continue;
+        }
+        fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[i]);
+        fx.glReadPixels(0, 0, fx.width, fx.height,
+                        FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, NULL);
+        fx.pbo_fence[i] = fx.glFenceSync(FX_GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!fx.pbo_fence[i]) {
+            trace_libretro_3dfx_readback("pbo-fence-failed",
+                                         fx.width, fx.height);
+            fx_pbo_fail();
+            return false;
+        }
+        fx.pbo_sequence[i] = ++fx.next_sequence;
+        trace_libretro_3dfx_readback("pbo-kick", fx.width, fx.height);
+        fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, 0);
+        return true;
+    }
+
+    fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, 0);
+    trace_libretro_3dfx_readback("pbo-full-skip", fx.width, fx.height);
     return true;
 }
 
@@ -262,15 +453,16 @@ static void fx_swap_readback(void)
         return;
     }
 
-    /* Bound the readback rate; publishing faster than the frontend
+    /* Bound the capture/poll rate; publishing faster than the frontend
      * presents only burns vCPU time under the BQL. Never skip after a
      * geometry change — the frontend re-inits its video driver to
      * black on those and needs a real frame at the new size. */
     int64_t now = g_get_monotonic_time();
     bool resized = fx.width != fx.pub_width || fx.height != fx.pub_height;
-    if (!resized && now - fx.last_publish_us < FX_PUBLISH_MIN_US) {
+    if (!resized && now - fx.last_capture_us < FX_CAPTURE_MIN_US) {
         return;
     }
+    fx.last_capture_us = now;
 
     size_t size = (size_t)fx.width * fx.height * 4;
     bool published = false;
@@ -280,48 +472,16 @@ static void fx_swap_readback(void)
      * the context current on this thread */
     fx.glPixelStorei(FX_GL_PACK_ALIGNMENT, 4);
 
-    /* Double-buffered PBO readback: kick an asynchronous transfer of
-     * this frame and publish the previous one, so this thread never
-     * waits for the GPU to drain. Costs one frame of extra latency on
-     * 3D content. The first frame at a new size takes the synchronous
+    /* The fenced three-buffer path maps only transfers the GPU reports
+     * complete. Drivers without sync objects retain the old two-PBO
+     * fallback. The first frame at a new size takes the synchronous
      * path below instead — it must reach the frontend now, not one
      * swap later. */
     if (!fx.pbo_broken && !resized && fx_pbo_ready(size)) {
-        int cur = fx.pbo_index, prev = cur ^ 1;
-
-        fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[cur]);
-        fx.glReadPixels(0, 0, fx.width, fx.height,
-                        FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, NULL);
-        trace_libretro_3dfx_readback("pbo-kick", fx.width, fx.height);
-        if (fx.pbo_filled[prev]) {
-            fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[prev]);
-            int64_t map_start = g_get_monotonic_time();
-            void *p = fx.glMapBuffer(FX_GL_PIXEL_PACK_BUFFER,
-                                     FX_GL_READ_ONLY);
-            trace_libretro_3dfx_map(fx.width, fx.height,
-                                    g_get_monotonic_time() - map_start);
-            if (p) {
-                /* rows are bottom-up; the frontend flips on present */
-                fx.sink->publish(p, fx.width, fx.height);
-                trace_libretro_3dfx_readback("pbo-publish", fx.width,
-                                             fx.height);
-                fx.glUnmapBuffer(FX_GL_PIXEL_PACK_BUFFER);
-                published = true;
-            } else {
-                fx.pbo_broken = true;
-            }
-        }
-        fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, 0);
-        if (fx.glGetError() != FX_GL_NO_ERROR) {
-            fx.pbo_broken = true;
-        }
-        if (fx.pbo_broken) {
-            warn_report_once("qemu-3dfx: PBO readback failed; using "
-                             "synchronous readback");
+        if (fx.sync_available) {
+            async_done = fx_pbo_fenced_readback(&published);
         } else {
-            fx.pbo_filled[cur] = true;
-            fx.pbo_index = prev;
-            async_done = true;
+            async_done = fx_pbo_legacy_readback(&published);
         }
     }
 
@@ -344,7 +504,6 @@ static void fx_swap_readback(void)
     }
 
     if (published) {
-        fx.last_publish_us = now;
         fx.pub_width = fx.width;
         fx.pub_height = fx.height;
     }
