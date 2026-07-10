@@ -34,7 +34,6 @@
 #include <windows.h>
 
 /* GL 1.1 subset, resolved from the opengl32.dll the devices already load */
-#define FX_GL_NO_ERROR       0
 #define FX_GL_UNSIGNED_BYTE  0x1401
 #define FX_GL_PACK_ALIGNMENT 0x0D05
 #define FX_GL_BGRA           0x80E1
@@ -88,7 +87,6 @@ static struct {
     void (WINAPI *glReadPixels)(int, int, int, int, unsigned, unsigned,
                                 void *);
     void (WINAPI *glPixelStorei)(unsigned, int);
-    unsigned (WINAPI *glGetError)(void);
     void (WINAPI *glGenBuffers)(int, unsigned *);
     void (WINAPI *glBindBuffer)(unsigned, unsigned);
     void (WINAPI *glBufferData)(unsigned, ptrdiff_t, const void *,
@@ -117,8 +115,7 @@ static bool fx_gl_resolve(void)
     }
     fx.glReadPixels = (void *)GetProcAddress(gl, "glReadPixels");
     fx.glPixelStorei = (void *)GetProcAddress(gl, "glPixelStorei");
-    fx.glGetError = (void *)GetProcAddress(gl, "glGetError");
-    return fx.glReadPixels && fx.glPixelStorei && fx.glGetError;
+    return fx.glReadPixels && fx.glPixelStorei;
 }
 
 /* GL extension entry points are context/driver state. Never carry them, PBO
@@ -127,7 +124,6 @@ static void fx_gl_forget_context(void)
 {
     fx.glReadPixels = NULL;
     fx.glPixelStorei = NULL;
-    fx.glGetError = NULL;
     fx.glGenBuffers = NULL;
     fx.glBindBuffer = NULL;
     fx.glBufferData = NULL;
@@ -457,10 +453,6 @@ static bool fx_pbo_legacy_readback(bool *published)
     }
 
     fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, 0);
-    if (fx.glGetError() != FX_GL_NO_ERROR) {
-        fx_pbo_fail();
-        return false;
-    }
 
     fx.pbo_filled[cur] = true;
     fx.pbo_index = prev;
@@ -597,16 +589,14 @@ static void fx_swap_readback(void)
         /* Synchronous path: PBO-less or erroring drivers, and the first
          * frame after a geometry change or frontend resume. */
         if (!fx.readback) {
-            fx.readback = g_malloc(size);
+            /* glReadPixels has no operation-local status result. Keep a
+             * deterministic black fallback without consuming the guest's
+             * context-global GL error queue to infer success. */
+            fx.readback = g_malloc0(size);
         }
         fx.glReadPixels(0, 0, fx.width, fx.height,
                         FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, fx.readback);
         trace_libretro_3dfx_readback("sync-publish", fx.width, fx.height);
-        if (fx.glGetError() != FX_GL_NO_ERROR) {
-            warn_report_once("qemu-3dfx: BGRA readback failed; "
-                             "3D output will not reach the frontend");
-            return;
-        }
         fx.sink->publish(fx.readback, fx.width, fx.height);
         published = true;
     }
