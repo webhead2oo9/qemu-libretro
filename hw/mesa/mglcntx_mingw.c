@@ -372,8 +372,13 @@ int MGLMakeCurrent(uint32_t cntxRC, int level)
 int MGLSwapBuffers(void)
 {
     MGLActivateHandler(1, 0);
-    MesaBlitScale();
-    mesa_swap_notify();     /* qemu-libretro: read the finished frame back */
+    /* qemu-libretro: read the finished frame back. When the guest asked
+     * for a flipped present (wine9x's raw top-down D3D frames) and the
+     * scaler blit didn't run to apply it, the back buffer still holds
+     * top-down rows — tell the readback glue so it publishes them
+     * without a second flip. */
+    int scaled = MesaBlitScale();
+    mesa_swap_notify(ScalerBlitFlip() && !scaled);
     return SwapBuffers(hDC);
 }
 

@@ -250,6 +250,28 @@ your own core, rebuild the wrappers from the same qemu-3dfx checkout.
 - **Glide:** `GLIDE*.DLL` alongside the game (or in `system32`).
 - **Direct3D:** drop a WineD3D set (`ddraw`/`d3d8`/`d3d9` + `wined3d`)
   into the game's folder. This is the most-tested D3D path.
+- **Direct3D also needs `wrapgl32.ext`** — see below, or the picture
+  renders upside down.
+
+### Guest-side wrapper config (`wrapgl32.ext`)
+
+The wrapper `OPENGL32.DLL` reads an optional plain-text config named
+`wrapgl32.ext` from the *running EXE's own directory* (the same folder
+the wrapper goes in). One `Option,value` per line, same syntax as
+`mesagl.cfg`.
+
+The one setting that is **required, not optional**, for Direct3D titles:
+
+```
+ScalerBltFlip,1
+```
+
+WineD3D presents its frames in top-down row order and delegates the
+vertical flip to the host (native GL games render bottom-up and need no
+flag). `ScalerBltFlip,1` tells the pass-through device the back buffer
+is top-down so the core can present it correctly; without it the game
+displays upside down. Set it only for WineD3D-bridged games — a native
+GL title with this flag would flip the *right*-side-up image over.
 
 ### Host-side config (next to the `.qemu_cmd_line`)
 

@@ -493,9 +493,13 @@ int mesa_gui_fullscreen(int *);
 
 /* called by hw/3dfx and hw/mesa right before their buffer swap, while
  * the pass-through GL context is current; the glue reads the finished
- * frame out of the back buffer */
+ * frame out of the back buffer. mesa passes top_down != 0 when the
+ * guest requested a flipped present (wine9x renders D3D frames in
+ * top-down row order and delegates the flip to the host) and no host
+ * blit has performed that flip, so the back buffer's rows are already
+ * in top-down order. */
 void glide_swap_notify(void);
-void mesa_swap_notify(void);
+void mesa_swap_notify(int top_down);
 
 /*
  * Frame sink registered by the display frontend (ui/libretro.c) so the
@@ -504,8 +508,12 @@ void mesa_swap_notify(void);
  * MMIO handler or timer ran on.
  */
 typedef struct QemuFxSink {
-    /* bottom-up BGRA rows (glReadPixels order), width * height * 4 bytes */
-    void (*publish)(const void *pixels, int width, int height);
+    /* BGRA rows, width * height * 4 bytes. Rows are bottom-up
+     * (glReadPixels order) unless top_down is set, which happens when
+     * the back buffer already held top-down rows (wine9x's raw D3D
+     * presents) so the readback needs no flip at all. */
+    void (*publish)(const void *pixels, int width, int height,
+                    bool top_down);
     /* guest entered (true) or left (false) 3D pass-through rendering */
     void (*set_active)(bool on);
     /* current guest display size, for sizing the context window */

@@ -903,10 +903,14 @@ static void refresh(DisplayChangeListener *dcl)
 
 #ifdef CONFIG_QEMU_3DFX
 // qemu-3dfx frame sink (see ui/libretro-3dfx.c). publish arrives from a
-// vCPU thread under the BQL with the finished 3D frame; rows come
-// bottom-up from glReadPixels (flipped at acquire time on the frontend
-// thread) and BGRA bytes already match XRGB8888.
-static void fx_sink_publish(const void *pixels, int w, int h)
+// vCPU thread under the BQL with the finished 3D frame; BGRA bytes
+// already match XRGB8888. Rows come bottom-up from glReadPixels
+// (flipped at acquire time on the frontend thread) unless the producer
+// says the back buffer already held top-down rows — wine9x presents its
+// D3D frames unflipped and delegates the flip to the host, so reading
+// those back yields top-down order that must pass through untouched.
+static void fx_sink_publish(const void *pixels, int w, int h,
+                            bool top_down)
 {
 	bool geometry_changed = false;
 
@@ -926,7 +930,7 @@ static void fx_sink_publish(const void *pixels, int w, int h)
 	pending_updated = false;
 	pending_ensure(w, h);
 	memcpy(pending_frame.buf, pixels, (size_t)w * h * 4);
-	pending_frame.bottom_up = true;
+	pending_frame.bottom_up = !top_down;
 	pthread_mutex_unlock(&frame_mutex);
 
 	/* retro_run observes AV state and the pending-frame flag together under
@@ -2129,55 +2133,6 @@ static int scale_mouse(int d, int *rem)
 	return out;
 }
 
-// Throwaway probe (pre-RetroPad scoping — remove with the real mapper):
-// reports what the frontend actually delivers on the joypad/analog
-// interface. Edge-triggered, so silent on frontends that deliver
-// nothing. Frontend thread only.
-static void pad_probe(void)
-{
-	static const char *const btn_names[16] = {
-		"B",	"Y",	 "Select", "Start", "Up", "Down",
-		"Left", "Right", "A",	   "X",	    "L",  "R",
-		"L2",	"R2",	 "L3",	   "R3",
-	};
-	static uint16_t down_prev;
-	static unsigned analog_hold;
-	uint16_t down_now = 0;
-
-	for (unsigned i = 0; i < 16; i++) {
-		if (cb_input_state(0, RETRO_DEVICE_JOYPAD, 0, i)) {
-			down_now |= 1u << i;
-		}
-	}
-	for (unsigned i = 0; i < 16; i++) {
-		if ((down_now ^ down_prev) & (1u << i)) {
-			notice_report("[pad] %s %s", btn_names[i],
-				      (down_now & (1u << i)) ? "down" : "up");
-		}
-	}
-	down_prev = down_now;
-
-	int lx = cb_input_state(0, RETRO_DEVICE_ANALOG,
-				RETRO_DEVICE_INDEX_ANALOG_LEFT,
-				RETRO_DEVICE_ID_ANALOG_X);
-	int ly = cb_input_state(0, RETRO_DEVICE_ANALOG,
-				RETRO_DEVICE_INDEX_ANALOG_LEFT,
-				RETRO_DEVICE_ID_ANALOG_Y);
-	int rx = cb_input_state(0, RETRO_DEVICE_ANALOG,
-				RETRO_DEVICE_INDEX_ANALOG_RIGHT,
-				RETRO_DEVICE_ID_ANALOG_X);
-	int ry = cb_input_state(0, RETRO_DEVICE_ANALOG,
-				RETRO_DEVICE_INDEX_ANALOG_RIGHT,
-				RETRO_DEVICE_ID_ANALOG_Y);
-	if (analog_hold) {
-		analog_hold--;
-	} else if (ABS(lx) > 8192 || ABS(ly) > 8192 || ABS(rx) > 8192 ||
-		   ABS(ry) > 8192) {
-		notice_report("[pad] L(%d,%d) R(%d,%d)", lx, ly, rx, ry);
-		analog_hold = 120; // ~2 s between analog reports
-	}
-}
-
 void retro_run(void)
 {
 #ifdef CONFIG_QEMU_3DFX
@@ -2196,8 +2151,6 @@ void retro_run(void)
 	    vars_updated) {
 		update_variables(false);
 	}
-
-	pad_probe();
 
 	// Sample all input into locals first — a frontend is free to do
 	// arbitrary work inside input_state, so no lock is held across it.

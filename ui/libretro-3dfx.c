@@ -71,6 +71,7 @@ static struct {
     unsigned pbo[FX_PBO_FENCED_COUNT]; /* current-context object names */
     void *pbo_fence[FX_PBO_FENCED_COUNT];
     uint64_t pbo_sequence[FX_PBO_FENCED_COUNT];
+    bool pbo_top_down[FX_PBO_FENCED_COUNT]; /* row order at capture time */
     uint64_t next_sequence;
     uint64_t min_publish_sequence;
     size_t pbo_size;
@@ -225,6 +226,7 @@ static void fx_window_destroy(void)
     memset(fx.pbo, 0, sizeof(fx.pbo));
     memset(fx.pbo_fence, 0, sizeof(fx.pbo_fence));
     memset(fx.pbo_sequence, 0, sizeof(fx.pbo_sequence));
+    memset(fx.pbo_top_down, 0, sizeof(fx.pbo_top_down));
     fx.pbo_size = 0;
     fx.pbo_count = 0;
     fx.pbo_index = 0;
@@ -455,8 +457,10 @@ static bool fx_pbo_publish(int index, const char *event, bool *published)
         return false;
     }
 
-    /* Rows are bottom-up; the frontend flips on present. */
-    fx.sink->publish(p, fx.width, fx.height);
+    /* Row order was latched when this PBO's readback was kicked; the
+     * frontend flips bottom-up frames on present and passes top-down
+     * ones through. */
+    fx.sink->publish(p, fx.width, fx.height, fx.pbo_top_down[index]);
     trace_libretro_3dfx_readback(event, fx.width, fx.height);
     *published = true;
     return fx.glUnmapBuffer(FX_GL_PIXEL_PACK_BUFFER) != 0;
@@ -465,7 +469,7 @@ static bool fx_pbo_publish(int index, const char *event, bool *published)
 /* Compatibility path for drivers that expose PBOs but not GL_ARB_sync.
  * This preserves the previous two-buffer behavior, including its possible
  * map wait, rather than dropping PBO acceleration on older wrappers. */
-static bool fx_pbo_legacy_readback(bool *published)
+static bool fx_pbo_legacy_readback(bool top_down, bool *published)
 {
     int cur = fx.pbo_index;
     int prev = cur ^ 1;
@@ -473,6 +477,7 @@ static bool fx_pbo_legacy_readback(bool *published)
     fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[cur]);
     fx.glReadPixels(0, 0, fx.width, fx.height,
                     FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, NULL);
+    fx.pbo_top_down[cur] = top_down;
     trace_libretro_3dfx_readback("pbo-kick-legacy", fx.width, fx.height);
 
     if (fx.pbo_filled[prev] &&
@@ -491,7 +496,7 @@ static bool fx_pbo_legacy_readback(bool *published)
 /* Poll every fence with a zero timeout and publish only the newest completed
  * transfer. Older completed frames are discarded, and a full ring skips the
  * next capture; neither condition is allowed to turn into a vCPU wait. */
-static bool fx_pbo_fenced_readback(bool *published)
+static bool fx_pbo_fenced_readback(bool top_down, bool *published)
 {
     bool ready[FX_PBO_FENCED_COUNT] = { false };
     int newest = -1;
@@ -549,6 +554,7 @@ static bool fx_pbo_fenced_readback(bool *published)
         fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[i]);
         fx.glReadPixels(0, 0, fx.width, fx.height,
                         FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, NULL);
+        fx.pbo_top_down[i] = top_down;
         fx.pbo_fence[i] = fx.glFenceSync(FX_GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (!fx.pbo_fence[i]) {
             trace_libretro_3dfx_readback("pbo-fence-failed",
@@ -567,7 +573,7 @@ static bool fx_pbo_fenced_readback(bool *published)
     return true;
 }
 
-static void fx_swap_readback(void)
+static void fx_swap_readback(bool top_down)
 {
     if (!fx.hwnd || !fx.width || !fx.height ||
         !fx.sink || !fx.sink->publish) {
@@ -608,9 +614,9 @@ static void fx_swap_readback(void)
      * supplies a current frame immediately instead of one swap later. */
     if (!fx.pbo_broken && !force_sync && fx_pbo_ready(size)) {
         if (fx.sync_available) {
-            async_done = fx_pbo_fenced_readback(&published);
+            async_done = fx_pbo_fenced_readback(top_down, &published);
         } else {
-            async_done = fx_pbo_legacy_readback(&published);
+            async_done = fx_pbo_legacy_readback(top_down, &published);
         }
     }
 
@@ -626,7 +632,7 @@ static void fx_swap_readback(void)
         fx.glReadPixels(0, 0, fx.width, fx.height,
                         FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, fx.readback);
         trace_libretro_3dfx_readback("sync-publish", fx.width, fx.height);
-        fx.sink->publish(fx.readback, fx.width, fx.height);
+        fx.sink->publish(fx.readback, fx.width, fx.height, top_down);
         published = true;
     }
 
@@ -636,14 +642,58 @@ static void fx_swap_readback(void)
     }
 }
 
-void mesa_swap_notify(void)
+/* The mesa hidden window is sized from the VGA surface when the guest
+ * creates its first GL context — for wine9x that happens at adapter
+ * enumeration, before the game switches the display mode, so the game
+ * then renders a smaller frame into a stale, larger back buffer (seen
+ * as the picture sitting high in a black band). Follow guest mode
+ * changes by resizing the window in place; the GL default framebuffer
+ * tracks the window. Glide is excluded: its window is sized from
+ * grSstWinOpen's packed resolution, which the VGA surface need not
+ * match (DOS-era guests run Glide at 640x480 over a text-mode VGA). */
+static bool fx_mesa_track_guest_size(void)
 {
-    fx_swap_readback();
+    int w, h;
+
+    if (!fx.hwnd) {
+        return false;
+    }
+    fx_guest_dims(&w, &h);
+    if ((w == fx.width && h == fx.height) ||
+        w <= 0 || h <= 0 || w > QEMU_FX_MAX_WIDTH ||
+        h > QEMU_FX_MAX_HEIGHT) {
+        return false;
+    }
+    if (!SetWindowPos(fx.hwnd, NULL, 0, 0, w, h,
+                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+        warn_report_once("qemu-3dfx: window resize to %dx%d failed (0x%lx)",
+                         w, h, GetLastError());
+        return false;
+    }
+    fx.width = w;
+    fx.height = h;
+    /* The sync-path buffer is sized once per window; the PBO ring
+     * re-sizes itself (and drops in-flight fences) in fx_pbo_ready. */
+    g_clear_pointer(&fx.readback, g_free);
+    trace_libretro_3dfx_readback("window-resize", w, h);
+    return true;
+}
+
+void mesa_swap_notify(int top_down)
+{
+    /* A resize discards the back buffer, so there is nothing valid to
+     * read this swap; the size change forces a synchronous publish on
+     * the next one (pub_width/pub_height no longer match). */
+    if (fx_mesa_track_guest_size()) {
+        return;
+    }
+    fx_swap_readback(top_down != 0);
 }
 
 void glide_swap_notify(void)
 {
-    fx_swap_readback();
+    /* Native GL rows, always bottom-up. */
+    fx_swap_readback(false);
 }
 
 /*

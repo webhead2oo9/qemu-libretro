@@ -225,8 +225,9 @@ static void blit_restore_savemap(const void *save_map)
             PFN_CALL(glEnable(boolean_states[i]));
     }
 }
-void MesaBlitScale(void)
+int MesaBlitScale(void)
 {
+    int scaled = 0;
     MESA_PFN(PFNGLACTIVETEXTUREPROC,            glActiveTexture);
     MESA_PFN(PFNGLBINDTEXTUREPROC,              glBindTexture);
     MESA_PFN(PFNGLBLITFRAMEBUFFERPROC,          glBlitFramebuffer);
@@ -248,7 +249,7 @@ void MesaBlitScale(void)
 
     if (blit.adj) {
         blit.adj = !blit.adj;
-        return;
+        return scaled;
     }
     blit.flip = ScalerBlitFlip();
 
@@ -315,9 +316,14 @@ void MesaBlitScale(void)
             PFN_CALL(glViewport(save_map.view[0], save_map.view[1],
                                 save_map.view[2], save_map.view[3]));
             blit_restore_savemap(&save_map);
+            scaled = 1;
         }
         PFN_CALL(glUseProgram(last_prog));
     }
+    /* qemu-libretro: tell the caller whether this present pass ran (it
+     * applies blit.flip when it does), so the readback glue knows if a
+     * guest-requested flip is still pending in the back buffer. */
+    return scaled;
 }
 
 void MesaRenderScaler(const uint32_t FEnum, void *args)
