@@ -152,10 +152,8 @@ static void fx_guest_dims(int *w, int *h)
     }
 }
 
-static bool fx_window_create(int w, int h)
+static bool fx_geometry_allowed(int w, int h)
 {
-    static const char class_name[] = "qemu-3dfx-libretro";
-
     if (w <= 0 || h <= 0 || w > QEMU_FX_MAX_WIDTH ||
         h > QEMU_FX_MAX_HEIGHT) {
         if (!fx.geometry_error_reported) {
@@ -166,6 +164,16 @@ static bool fx_window_create(int w, int h)
             fx.geometry_error_reported = true;
         }
         vm_stop(RUN_STATE_INTERNAL_ERROR);
+        return false;
+    }
+    return true;
+}
+
+static bool fx_window_create(int w, int h)
+{
+    static const char class_name[] = "qemu-3dfx-libretro";
+
+    if (!fx_geometry_allowed(w, h)) {
         return false;
     }
 
@@ -650,8 +658,10 @@ static void fx_swap_readback(bool top_down)
  * changes by resizing the window in place; the GL default framebuffer
  * tracks the window. Glide is excluded: its window is sized from
  * grSstWinOpen's packed resolution, which the VGA surface need not
- * match (DOS-era guests run Glide at 640x480 over a text-mode VGA). */
-static bool fx_mesa_track_guest_size(void)
+ * match (DOS-era guests run Glide at 640x480 over a text-mode VGA).
+ * Return true when the current back buffer must not be captured: either a
+ * resize discarded it, or an unsafe size was rejected and the VM stopped. */
+static bool fx_mesa_prepare_guest_size(void)
 {
     int w, h;
 
@@ -659,10 +669,11 @@ static bool fx_mesa_track_guest_size(void)
         return false;
     }
     fx_guest_dims(&w, &h);
-    if ((w == fx.width && h == fx.height) ||
-        w <= 0 || h <= 0 || w > QEMU_FX_MAX_WIDTH ||
-        h > QEMU_FX_MAX_HEIGHT) {
+    if (w == fx.width && h == fx.height) {
         return false;
+    }
+    if (!fx_geometry_allowed(w, h)) {
+        return true;
     }
     if (!SetWindowPos(fx.hwnd, NULL, 0, 0, w, h,
                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
@@ -684,7 +695,7 @@ void mesa_swap_notify(int top_down)
     /* A resize discards the back buffer, so there is nothing valid to
      * read this swap; the size change forces a synchronous publish on
      * the next one (pub_width/pub_height no longer match). */
-    if (fx_mesa_track_guest_size()) {
+    if (fx_mesa_prepare_guest_size()) {
         return;
     }
     fx_swap_readback(top_down != 0);
