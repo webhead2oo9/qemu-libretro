@@ -276,6 +276,11 @@ not in the RetroArch folder:
   drops stale ones, so latency can increase temporarily under heavy GPU load
   instead of stalling guest execution and audio. Capture also stops while the
   frontend is not calling `retro_run` and resumes with a current frame.
+- qemu-3dfx pass-through requires a single virtual CPU. Because host OpenGL
+  calls run on the vCPU thread, a multi-vCPU VM could access one WGL context
+  from different host threads. The core pauses before 3D activation and shows
+  an error when `-smp` permits more than one CPU; remove `-smp` or use
+  `-smp 1`, then restart the content. Non-3D VMs are unaffected.
 - Save states are unreliable while 3D pass-through is active.
 
 ## Examples

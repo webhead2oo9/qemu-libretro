@@ -26,6 +26,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "hw/boards.h"
+#include "sysemu/runstate.h"
 #include "ui/console.h"
 #include "trace.h"
 
@@ -80,6 +82,7 @@ static struct {
     uint32_t frontend_frame_count;
     int64_t frontend_last_seen_us;
     bool frontend_idle;
+    bool smp_error_reported;
     bool pbo_broken;            /* no PBO support, or it errored: stay
                                  * on the synchronous path for good */
     void (WINAPI *glReadPixels)(int, int, int, int, unsigned, unsigned,
@@ -100,6 +103,7 @@ static struct {
 void qemu_fx_register_sink(const QemuFxSink *sink)
 {
     fx.sink = sink;
+    fx.smp_error_reported = false;
 }
 
 static bool fx_gl_resolve(void)
@@ -226,6 +230,31 @@ static void fx_set_active(bool on)
     if (fx.sink && fx.sink->set_active) {
         fx.sink->set_active(on);
     }
+}
+
+/* The qemu-3dfx devices issue host GL calls directly from the vCPU thread that
+ * handled their MMIO. A WGL context cannot migrate safely between multiple
+ * vCPU threads without dedicated render-thread marshalling, so stop before a
+ * context/window exists rather than allowing intermittent host-driver access.
+ * Check max_cpus as well as online CPUs so later CPU hotplug cannot invalidate
+ * a context that was safe when it was created. */
+static bool fx_3d_activation_allowed(void)
+{
+    unsigned int cpus;
+
+    if (!current_machine || current_machine->smp.max_cpus <= 1) {
+        return true;
+    }
+
+    cpus = current_machine->smp.max_cpus;
+    if (!fx.smp_error_reported) {
+        error_report("qemu-3dfx requires one virtual CPU; this VM permits "
+                     "%u. The VM was paused before 3D activation. Remove "
+                     "-smp or use -smp 1, then restart the content", cpus);
+        fx.smp_error_reported = true;
+    }
+    vm_stop(RUN_STATE_INTERNAL_ERROR);
+    return false;
 }
 
 /* Windows may return 1, 2, 3, or -1 for an unsupported extension symbol,
@@ -612,6 +641,9 @@ void mesa_prepare_window(int msaa, int alpha, int scale_x, void *cwnd_fn)
     int w, h;
 
     fx_window_destroy();
+    if (!fx_3d_activation_allowed()) {
+        return;
+    }
     fx_guest_dims(&w, &h);
     if (!fx_window_create(w, h)) {
         return;         /* wnd_ready stays 0; the guest keeps polling */
@@ -673,6 +705,9 @@ void glide_prepare_window(uint32_t res, int msaa, void *opaque,
 
     fx_window_destroy();
     fx.glide_ready = false;
+    if (!fx_3d_activation_allowed()) {
+        return;
+    }
     if (!w || !h) {
         w = 640;
         h = 480;
