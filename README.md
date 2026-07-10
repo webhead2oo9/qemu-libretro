@@ -196,9 +196,11 @@ gamepad** toggle does this for you):
 -usb -device usb-gamepad,index=0
 ```
 
-The device has four signed 16-bit axes, a POV hat, and 12 buttons. Windows
-98SE and XP use their generic USB HID game-controller support; no
-device-specific driver is required. The fixed mapping is:
+The device has four signed 16-bit axes, a POV hat, and 12 buttons. Its
+descriptor targets the generic USB HID game-controller support in Windows
+98SE and XP, so there is no device-specific QEMU driver to install (98SE may
+still ask for its Windows setup media when loading the in-box USB/HID files).
+The fixed mapping is:
 
 | Guest control | RetroPad input |
 | --- | --- |
