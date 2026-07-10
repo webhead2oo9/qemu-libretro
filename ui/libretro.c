@@ -7,6 +7,7 @@
 #include <glib/gstdio.h>
 
 #include "retro-gen.h"
+#include "qemu-version.h"
 #include "qemu/datadir.h"
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
@@ -474,7 +475,9 @@ void retro_get_system_info(struct retro_system_info *info)
 	memset(info, 0, sizeof(*info));
 	info->need_fullpath = true;
 	info->valid_extensions = "qemu_cmd_line|iso|img|qcow|qcow2|m3u";
-	info->library_version = "0.1.0";
+	/* Includes git describe for checkout builds, making the frontend's core
+	 * information useful when identifying deployed binaries. */
+	info->library_version = QEMU_FULL_VERSION;
 	info->library_name = "qemu";
 }
 

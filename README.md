@@ -2,6 +2,12 @@
 
 This is a libretro QEMU core, allowing to run VMs in a libretro frontend.
 
+For EmuVR, the recommended companion is the
+[EmuVR VM Wizard](https://github.com/webhead2oo9/emuvr-vm-wizard). It creates
+and organizes VM launchers, validates the installed core and firmware, and
+handles per-VM options such as WHPX, networking, 3D profiles, and the USB
+gamepad without requiring hand-edited command lines.
+
 This fork of [io12/qemu-libretro](https://github.com/io12/qemu-libretro)
 focuses on older RetroArch frontends:
 
@@ -40,10 +46,14 @@ and it will be run with the command
 qemu-system-x86_64 -audiodev libretro,id=snd0 -machine pcspk-audiodev=snd0 -device AC97,audiodev=snd0 PATH_TO_OPENED_FILE
 ```
 
-If you need more customization, such as increasing memory or using a different architecture than x86_64,
-you can provide your own QEMU command in a `.qemu_cmd_line` file.
-It uses the [`g_shell_parse_argv()`](https://docs.gtk.org/glib/func.shell_parse_argv.html) function and not an actual shell to parse the command, so it will only supports simple shell features.
-The core interprets relative paths as relative to the directory containing the `.qemu_cmd_line` file.
+If you need more customization, such as increasing memory or using a different
+architecture than x86_64, you can provide your own QEMU command in a
+`.qemu_cmd_line` file. It uses the
+[`g_shell_parse_argv()`](https://docs.gtk.org/glib/func.shell_parse_argv.html)
+function and not an actual shell to parse the command, so it supports quoting
+and escaping but not shell features such as pipes, redirects, or
+environment-variable expansion. The core interprets relative paths as
+relative to the directory containing the `.qemu_cmd_line` file.
 
 **Note:** commands in a `.qemu_cmd_line` file run exactly as written — the
 audio flags shown above are *not* added automatically, so include
@@ -346,6 +356,15 @@ not in the RetroArch folder:
   buffers, and the VM pauses with an error instead of clipping the frame or
   allocating an arbitrary guest-selected amount of host memory.
 - Save states are unreliable while 3D pass-through is active.
+
+### Reporting the installed build
+
+RetroArch's core information screen reports the QEMU version and, for builds
+made from a Git checkout, the `git describe` revision or commit ID (including
+a `-dirty` suffix when tracked source files were modified). Include that
+string with bug reports so deployed-core issues can be matched to source.
+Builds made from source archives report the base QEMU version when no revision
+metadata is available.
 
 ## Examples
 
