@@ -27,6 +27,7 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "ui/console.h"
+#include "trace.h"
 
 #include <windows.h>
 
@@ -94,6 +95,21 @@ static bool fx_gl_resolve(void)
     return fx.glReadPixels && fx.glPixelStorei && fx.glGetError;
 }
 
+/* GL extension entry points are context/driver state. Never carry them, PBO
+ * names, or a latched capability failure into the next hidden-window context. */
+static void fx_gl_forget_context(void)
+{
+    fx.glReadPixels = NULL;
+    fx.glPixelStorei = NULL;
+    fx.glGetError = NULL;
+    fx.glGenBuffers = NULL;
+    fx.glBindBuffer = NULL;
+    fx.glBufferData = NULL;
+    fx.glMapBuffer = NULL;
+    fx.glUnmapBuffer = NULL;
+    fx.pbo_broken = false;
+}
+
 static void fx_guest_dims(int *w, int *h)
 {
     *w = 640;
@@ -150,14 +166,14 @@ static void fx_window_destroy(void)
     fx.width = 0;
     fx.height = 0;
     /* The GL context that owned the PBOs dies with the window; forget
-     * the names (pbo_broken deliberately survives — the driver will
-     * not grow PBO support between windows). */
+     * its object names and retry capability resolution in the next one. */
     fx.pbo[0] = 0;
     fx.pbo[1] = 0;
     fx.pbo_size = 0;
     fx.pbo_index = 0;
     fx.pbo_filled[0] = false;
     fx.pbo_filled[1] = false;
+    fx_gl_forget_context();
     /* zero pub geometry: the first frame in a new window must publish
      * immediately, however recently the old window published */
     fx.pub_width = 0;
@@ -276,13 +292,19 @@ static void fx_swap_readback(void)
         fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[cur]);
         fx.glReadPixels(0, 0, fx.width, fx.height,
                         FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, NULL);
+        trace_libretro_3dfx_readback("pbo-kick", fx.width, fx.height);
         if (fx.pbo_filled[prev]) {
             fx.glBindBuffer(FX_GL_PIXEL_PACK_BUFFER, fx.pbo[prev]);
+            int64_t map_start = g_get_monotonic_time();
             void *p = fx.glMapBuffer(FX_GL_PIXEL_PACK_BUFFER,
                                      FX_GL_READ_ONLY);
+            trace_libretro_3dfx_map(fx.width, fx.height,
+                                    g_get_monotonic_time() - map_start);
             if (p) {
                 /* rows are bottom-up; the frontend flips on present */
                 fx.sink->publish(p, fx.width, fx.height);
+                trace_libretro_3dfx_readback("pbo-publish", fx.width,
+                                             fx.height);
                 fx.glUnmapBuffer(FX_GL_PIXEL_PACK_BUFFER);
                 published = true;
             } else {
@@ -311,6 +333,7 @@ static void fx_swap_readback(void)
         }
         fx.glReadPixels(0, 0, fx.width, fx.height,
                         FX_GL_BGRA, FX_GL_UNSIGNED_BYTE, fx.readback);
+        trace_libretro_3dfx_readback("sync-publish", fx.width, fx.height);
         if (fx.glGetError() != FX_GL_NO_ERROR) {
             warn_report_once("qemu-3dfx: BGRA readback failed; "
                              "3D output will not reach the frontend");

@@ -17,6 +17,10 @@ displaychangelistener_register(void *dcl, const char *name) "%p [ %s ]"
 displaychangelistener_unregister(void *dcl, const char *name) "%p [ %s ]"
 ppm_save(int fd, void *image) "fd=%d image=%p"
 
+# libretro-3dfx.c
+libretro_3dfx_readback(const char *event, int width, int height) "%s %dx%d"
+libretro_3dfx_map(int width, int height, int64_t duration_us) "%dx%d map took %" PRIi64 " us"
+
 # gtk-egl.c
 # gtk-gl-area.c
 # gtk.c
