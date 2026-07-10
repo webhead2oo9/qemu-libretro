@@ -227,13 +227,12 @@ static void pending_ensure(int w, int h)
 	}
 }
 
-// Swap in the newest published frame, if any; frontend thread only.
-// Returns true when present_frame now holds fresh content.
-static bool frame_acquire(void)
+// Swap in the newest published frame, if any; frontend thread only and
+// frame_mutex held. Returns true when present_frame now holds fresh content.
+static bool frame_acquire_locked(void)
 {
 	bool fresh = false;
 
-	pthread_mutex_lock(&frame_mutex);
 	if (pending_updated) {
 		struct frame_slot tmp = pending_frame;
 		pending_frame = present_frame;
@@ -242,8 +241,12 @@ static bool frame_acquire(void)
 		present_valid = true;
 		fresh = true;
 	}
-	pthread_mutex_unlock(&frame_mutex);
+	return fresh;
+}
 
+// Finish acquiring a 3D frame outside every handoff lock.
+static void frame_finish_acquire(bool fresh)
+{
 	// 3D frames arrive in glReadPixels order; flip them here, outside
 	// the lock, so the vCPU that published never pays for it.
 	if (fresh && present_frame.bottom_up) {
@@ -266,8 +269,6 @@ static bool frame_acquire(void)
 		}
 		present_frame.bottom_up = false;
 	}
-
-	return fresh;
 }
 
 // Notifications. QEMU reports errors from arbitrary threads, but libretro
@@ -907,6 +908,8 @@ static void refresh(DisplayChangeListener *dcl)
 // thread) and BGRA bytes already match XRGB8888.
 static void fx_sink_publish(const void *pixels, int w, int h)
 {
+	bool geometry_changed = false;
+
 	/* ui/libretro-3dfx.c validates before creating its window/PBOs. Keep
 	 * this boundary defensive: never size a frontend buffer from unchecked
 	 * dimensions if another producer is added later. */
@@ -916,15 +919,20 @@ static void fx_sink_publish(const void *pixels, int w, int h)
 		return;
 	}
 
+	/* Build the replacement while it is hidden. Publishers are serialized
+	 * under the BQL, so clearing pending_updated only discards an older frame
+	 * that this newer one supersedes. */
 	pthread_mutex_lock(&frame_mutex);
+	pending_updated = false;
 	pending_ensure(w, h);
 	memcpy(pending_frame.buf, pixels, (size_t)w * h * 4);
 	pending_frame.bottom_up = true;
-	pending_updated = true;
 	pthread_mutex_unlock(&frame_mutex);
 
+	/* retro_run observes AV state and the pending-frame flag together under
+	 * this same AV -> frame lock order. Publish both as one handoff, so an
+	 * oversized frame can never be acquired with the old frontend envelope. */
 	pthread_mutex_lock(&av_info_lock);
-	bool geometry_changed = false;
 	if (av_info.geometry.max_width < (unsigned)w) {
 		av_info.geometry.max_width = w;
 		geometry_changed = true;
@@ -942,6 +950,9 @@ static void fx_sink_publish(const void *pixels, int w, int h)
 	if (geometry_changed) {
 		changed_geometry = true;
 	}
+	pthread_mutex_lock(&frame_mutex);
+	pending_updated = true;
+	pthread_mutex_unlock(&frame_mutex);
 	pthread_mutex_unlock(&av_info_lock);
 }
 
@@ -2264,17 +2275,23 @@ void retro_run(void)
 		return;
 	}
 
-	// Snapshot av_info and deliver changes outside av_info_lock:
+	// Snapshot av_info and acquire its corresponding frame before releasing
+	// av_info_lock. The 3D producer publishes AV -> frame in the same lock
+	// order, so an oversized frame cannot outrun the frontend envelope.
+	// Deliver callbacks outside both locks:
 	// SET_SYSTEM_AV_INFO can re-init the frontend's drivers, and
 	// publishers must stay free to update av_info meanwhile.
 	struct retro_system_av_info av_local;
-	bool geom_changed, timing_changed;
+	bool geom_changed, timing_changed, fresh;
 	pthread_mutex_lock(&av_info_lock);
 	geom_changed = changed_geometry;
 	timing_changed = changed_timing;
 	changed_geometry = false;
 	changed_timing = false;
 	av_local = av_info;
+	pthread_mutex_lock(&frame_mutex);
+	fresh = frame_acquire_locked();
+	pthread_mutex_unlock(&frame_mutex);
 	pthread_mutex_unlock(&av_info_lock);
 	bool env_grows = av_local.geometry.base_width > delivered_env_w ||
 			 av_local.geometry.base_height > delivered_env_h;
@@ -2303,7 +2320,7 @@ void retro_run(void)
 	// owned by this thread, so no lock is held across cb_video_refresh —
 	// publishers run under the BQL and must never wait on the frontend's
 	// upload/vsync.
-	bool fresh = frame_acquire();
+	frame_finish_acquire(fresh);
 	if (present_valid) {
 		cb_video_refresh(fresh ? present_frame.buf : NULL,
 				 present_frame.w, present_frame.h,
