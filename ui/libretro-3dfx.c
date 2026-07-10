@@ -228,6 +228,21 @@ static void fx_set_active(bool on)
     }
 }
 
+/* Windows may return 1, 2, 3, or -1 for an unsupported extension symbol,
+ * not just NULL. Treat every documented sentinel as absent before deciding
+ * whether the driver supports the fenced path. */
+static void *fx_wgl_get_proc(PROC (WINAPI *getproc)(LPCSTR),
+                             const char *name)
+{
+    void *p = (void *)getproc(name);
+
+    if (!p || p == (void *)(uintptr_t)1 || p == (void *)(uintptr_t)2 ||
+        p == (void *)(uintptr_t)3 || p == (void *)(intptr_t)-1) {
+        return NULL;
+    }
+    return p;
+}
+
 static bool fx_pbo_resolve(void)
 {
     /* PBO entry points postdate opengl32.dll's export table; they only
@@ -247,9 +262,9 @@ static bool fx_pbo_resolve(void)
         return false;
     }
 #define FX_RESOLVE(fn) \
-    fx.fn = (void *)getproc(#fn); \
+    fx.fn = fx_wgl_get_proc(getproc, #fn); \
     if (!fx.fn) { \
-        fx.fn = (void *)getproc(#fn "ARB"); \
+        fx.fn = fx_wgl_get_proc(getproc, #fn "ARB"); \
     }
     FX_RESOLVE(glGenBuffers);
     FX_RESOLVE(glBindBuffer);
