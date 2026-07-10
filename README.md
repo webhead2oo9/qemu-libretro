@@ -15,6 +15,8 @@ focuses on older RetroArch frontends:
   [qemu-3dfx](https://github.com/kjliew/qemu-3dfx) pass-through — Glide
   and OpenGL games render on the host GPU (see *3D acceleration* below).
 - **User-mode networking**: `-netdev user` (slirp) is built in.
+- **USB HID gamepad**: RetroArch controller port 1 can appear inside x86
+  guests as a standard 4-axis, 12-button USB game controller.
 - Performance work throughout: frame presentation, audio, and input no
   longer block the emulator on the frontend (fixes audio crackle), WHPX
   guests get hardware dirty-page tracking (idle desktops stop burning
@@ -54,8 +56,8 @@ Common knobs are also exposed as core options (in RetroArch: Quick Menu →
 Options), so many setups need no hand-edited command line at all:
 
 - **Guest RAM**, **Boot device**, **CPU accelerator**, **WHPX security
-  isolation**, **Audio buffer** — take effect on the next restart of the
-  content.
+  isolation**, **Audio buffer**, **RetroPad device** — take effect on the
+  next restart of the content.
 - **Mouse speed** — live.
 - **3D FPS limit**, **3D GL extensions year** — global defaults for the
   qemu-3dfx pass-through; picked up when the guest starts its next 3D app.
@@ -99,6 +101,9 @@ appended if missing. Specifics:
 - **Audio buffer** rewrites `out.buffer-length` on the libretro audiodev,
   and is skipped (with a notice) when the command line has no libretro
   audiodev.
+- **RetroPad device** adds the index-0 USB HID gamepad and enables the PC USB
+  bus. It applies only to x86 PC guests and does not replace any hand-added
+  USB devices. `auto` leaves the command line alone.
 - The **3D** options override `FpsLimit`/`ExtensionsYear` after the cfg
   files are read — precedence is core option > per-game
   `mesagl.cfg`/`glide.cfg` > built-in — and the cfg files are never
@@ -177,6 +182,39 @@ qemu-system-x86_64 ... -netdev user,id=net0 -device rtl8139,netdev=net0
 
 Use `pcnet` for Windows 9x guests (in-box driver), `rtl8139` for
 2000/XP, or `e1000` for newer systems.
+
+### USB HID gamepad
+
+The optional gamepad exposes libretro controller port 1 to an x86 guest as a
+real USB HID game controller. Enable **Quick Menu → Options → RetroPad
+device → USB HID gamepad**, then fully restart the content. For per-VM control
+on RetroArch 1.7.5/EmuVR, leave that global option at `auto` and add these
+flags to the VM's `.qemu_cmd_line` instead (the EmuVR VM Wizard's **USB
+gamepad** toggle does this for you):
+
+```sh
+-usb -device usb-gamepad,index=0
+```
+
+The device has four signed 16-bit axes, a POV hat, and 12 buttons. Its
+descriptor targets the generic USB HID game-controller support in Windows
+98SE and XP, so there is no device-specific QEMU driver to install (98SE may
+still ask for its Windows setup media when loading the in-box USB/HID files).
+The fixed mapping is:
+
+| Guest control | RetroPad input |
+| --- | --- |
+| X / Y | Left analog stick |
+| Rx / Ry | Right analog stick |
+| POV hat | D-pad |
+| Buttons 1–4 | B, A, Y, X |
+| Buttons 5–8 | L, R, L2, R2 |
+| Buttons 9–12 | Select, Start, L3, R3 |
+
+Version 1 exposes one controller (`index=0`) from port 1. Selecting **None**
+for that frontend controller port releases every guest button and centers all
+axes. The feature is opt-in; without the core option or command-line device,
+existing keyboard and mouse behavior is unchanged.
 
 ### Audio buffer
 
