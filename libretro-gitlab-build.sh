@@ -183,6 +183,7 @@ CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
     --disable-sdl \
     --enable-slirp \
     -Dwrap_mode=forcefallback \
+    -Db_staticpic=true \
     ${EXTRA_CONFIGURE_ARGS[@]+"${EXTRA_CONFIGURE_ARGS[@]}"}
 
 BUILD_OUT=libqemu_libretro.$LIB_EXT

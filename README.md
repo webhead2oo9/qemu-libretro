@@ -318,15 +318,24 @@ not in the RetroArch folder:
    Mac OS 9 needs `openbios-ppc` and `qemu_vga.ndrv` from `pc-bios/` in your
    RetroArch `system/qemu` folder (see *Setup: firmware* above).
 
-## Compile instructions (Ubuntu)
+## Compile instructions (Ubuntu or WSL)
+
+Run the clone and submodule commands from the Ubuntu/WSL shell, preferably on
+its Linux filesystem. QEMU's shell scripts (including `configure`) require LF
+line endings, and submodules do not inherit this repository's
+`.gitattributes`. An older checkout created by Git for Windows with automatic
+CRLF conversion must be re-cloned or renormalized before use in WSL.
 
 ```sh
-sudo apt-get install build-essential python3 python3-venv ninja-build flex bison zlib1g-dev
-git clone --recursive https://github.com/webhead2oo9/qemu-libretro
+sudo apt-get update
+sudo apt-get install build-essential git python3 python3-venv python3-pip ninja-build flex bison pkgconf zlib1g-dev
+git clone https://github.com/webhead2oo9/qemu-libretro.git
 cd qemu-libretro
+git submodule update --init libretro-common zlib
 mkdir build
 cd build
 CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
+    --target-list=x86_64-softmmu \
     --without-default-features \
     --glib=internal \
     --zlib=internal \
@@ -334,19 +343,29 @@ CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
     --enable-fdt=internal \
     --disable-modules \
     --disable-plugins \
+    --enable-kvm \
     --enable-libretro \
     --audio-drv-list=libretro \
     --disable-sdl \
-    -Dwrap_mode=forcefallback
+    --enable-slirp \
+    -Dwrap_mode=forcefallback \
+    -Db_staticpic=true
 make -j$(nproc) libqemu_libretro.so
 ```
+
+This builds the x86_64 system core used for PC guests. Add comma-separated
+targets to `--target-list` (for example, `ppc-softmmu` for Mac OS 9) when
+needed; omitting the option makes QEMU configure every supported system and
+user target and greatly increases build time.
 
 ## Cross-compiling the Windows core (from Ubuntu or WSL)
 
 ```sh
-sudo apt-get install build-essential gcc-mingw-w64-x86-64 ninja-build flex bison python3-venv python3-pip pkgconf git
-git clone --recursive https://github.com/webhead2oo9/qemu-libretro
+sudo apt-get update
+sudo apt-get install build-essential gcc-mingw-w64-x86-64 ninja-build flex bison python3 python3-venv python3-pip pkgconf git
+git clone https://github.com/webhead2oo9/qemu-libretro.git
 cd qemu-libretro
+git submodule update --init libretro-common zlib
 (cd zlib && ./configure)
 mkdir build
 cd build
@@ -362,10 +381,13 @@ CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
     --enable-libretro \
     --audio-drv-list=libretro \
     --disable-sdl \
+    --enable-slirp \
     -Dwrap_mode=forcefallback \
+    -Db_staticpic=true \
     --cross-prefix=x86_64-w64-mingw32- \
     --extra-ldflags=-static \
-    --enable-whpx
+    --enable-whpx \
+    --enable-qemu-3dfx
 make -j$(nproc) libqemu_libretro.dll
 ```
 
@@ -373,4 +395,8 @@ Drop the resulting DLL into RetroArch's `cores` folder as
 `qemu_libretro.dll`. Add more targets to `--target-list` (e.g.
 `ppc-softmmu` for Mac OS 9) if you need them.
 
-For help compiling for other platforms, see the [CI build script](libretro-gitlab-build.sh).
+The manual Windows recipe builds only the x86_64 system target. The CI script
+builds a much broader architecture set and publishes the qemu-3dfx signature
+marker used to match guest wrappers to the core. For other platforms and the
+release-like build, see the [CI build script](libretro-gitlab-build.sh); note
+that it removes `build/` and may update packages in its CI environment.
