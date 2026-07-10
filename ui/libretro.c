@@ -493,9 +493,9 @@ static unsigned delivered_env_w;
 static unsigned delivered_env_h;
 static struct retro_system_av_info av_info = {
 	.geometry = {
-		// base_* track the guest mode; max_* are a fixed ceiling no
-		// supported guest mode exceeds (Cirrus/std VGA top out at
-		// 1600x1200), because raising max_* would need exactly the
+		// base_* track the guest mode. max_* start above every Cirrus/std
+		// VGA mode (those top out at 1600x1200); qemu-3dfx may grow them
+		// through QEMU_FX_MAX_* and trigger exactly the one-time
 		// SET_SYSTEM_AV_INFO reinit described above.
 		//
 		// The initial base is deliberately 1024x768 rather than the
