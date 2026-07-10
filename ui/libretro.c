@@ -1530,7 +1530,7 @@ static bool args_has_gamepad_zero(GPtrArray *args)
 			if (g_str_has_prefix(*p, "index=")) {
 				char *end = NULL;
 				unsigned long parsed = g_ascii_strtoull(
-					*p + strlen("index="), &end, 10);
+					*p + strlen("index="), &end, 0);
 				valid_index = end && !*end &&
 					      parsed <= G_MAXUINT;
 				if (valid_index) {

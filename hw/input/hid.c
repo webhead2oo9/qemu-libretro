@@ -488,11 +488,11 @@ int hid_gamepad_poll(HIDState *hs, uint8_t *buf, int len)
 {
     const QemuGamepadState *state = &hs->gamepad.state;
 
-    hs->idle_pending = false;
-    hs->n = 0;
     if (len < 11) {
         return 0;
     }
+    hs->idle_pending = false;
+    hs->n = 0;
 
     for (int i = 0; i < 4; i++) {
         uint16_t axis = state->axis[i];
