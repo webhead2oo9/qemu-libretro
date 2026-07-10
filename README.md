@@ -75,6 +75,27 @@ appended if missing. Specifics:
   secure isolation. `off (trusted guests only)` can significantly improve
   MMIO-heavy workloads by skipping VM-entry/exit side-channel mitigations;
   use it only with guest software and disk images you trust.
+
+  After installing a core built with this option, change it under **Quick
+  Menu → Options → WHPX security isolation**, then fully restart the
+  content/VM. `on` explicitly enables isolation; `off (trusted guests only)`
+  selects performance mode. The equivalent raw core-options values are:
+
+  ```ini
+  qemu_whpx_isolation = "on"
+  qemu_whpx_isolation = "off (trusted guests only)"
+  ```
+
+  RetroArch 1.7.5/EmuVR applies core options globally. For per-game control,
+  leave the core option at `auto` and replace the accelerator flags in the
+  trusted VM's existing, complete `.qemu_cmd_line` with:
+
+  ```text
+  -accel whpx,ssd=off -accel tcg
+  ```
+
+  Restore per-game isolation by replacing those flags with
+  `-accel whpx,ssd=on -accel tcg`.
 - **Audio buffer** rewrites `out.buffer-length` on the libretro audiodev,
   and is skipped (with a notice) when the command line has no libretro
   audiodev.
