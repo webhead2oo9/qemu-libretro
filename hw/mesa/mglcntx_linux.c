@@ -451,6 +451,11 @@ int MGLMakeCurrent(uint32_t cntxRC, int level)
     return 0;
 }
 
+void MGLReleaseCurrent(void)
+{
+    glXMakeContextCurrent(dpy, None, None, NULL);
+}
+
 int MGLSwapBuffers(void)
 {
     MGLActivateHandler(1, 0);

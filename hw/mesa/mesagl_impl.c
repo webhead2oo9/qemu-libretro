@@ -94,6 +94,61 @@ int wrMapOrderPoints(uint32_t target)
     return (v[0]*v[1]);
 }
 
+int wrPixelMapSize(uint32_t map)
+{
+    MESA_PFN(PFNGLGETINTEGERVPROC, glGetIntegerv);
+    enum {
+        QXP_GL_PIXEL_MAP_I_TO_I = 0x0c70,
+        QXP_GL_PIXEL_MAP_S_TO_S = 0x0c71,
+        QXP_GL_PIXEL_MAP_I_TO_R = 0x0c72,
+        QXP_GL_PIXEL_MAP_I_TO_G = 0x0c73,
+        QXP_GL_PIXEL_MAP_I_TO_B = 0x0c74,
+        QXP_GL_PIXEL_MAP_I_TO_A = 0x0c75,
+        QXP_GL_PIXEL_MAP_R_TO_R = 0x0c76,
+        QXP_GL_PIXEL_MAP_G_TO_G = 0x0c77,
+        QXP_GL_PIXEL_MAP_B_TO_B = 0x0c78,
+        QXP_GL_PIXEL_MAP_A_TO_A = 0x0c79,
+        QXP_GL_PIXEL_MAP_I_TO_I_SIZE = 0x0cb0,
+        QXP_GL_PIXEL_MAP_S_TO_S_SIZE = 0x0cb1,
+        QXP_GL_PIXEL_MAP_I_TO_R_SIZE = 0x0cb2,
+        QXP_GL_PIXEL_MAP_I_TO_G_SIZE = 0x0cb3,
+        QXP_GL_PIXEL_MAP_I_TO_B_SIZE = 0x0cb4,
+        QXP_GL_PIXEL_MAP_I_TO_A_SIZE = 0x0cb5,
+        QXP_GL_PIXEL_MAP_R_TO_R_SIZE = 0x0cb6,
+        QXP_GL_PIXEL_MAP_G_TO_G_SIZE = 0x0cb7,
+        QXP_GL_PIXEL_MAP_B_TO_B_SIZE = 0x0cb8,
+        QXP_GL_PIXEL_MAP_A_TO_A_SIZE = 0x0cb9,
+    };
+    GLenum pname;
+    GLint size = 1;
+
+    switch (map) {
+    case QXP_GL_PIXEL_MAP_I_TO_I:
+        pname = QXP_GL_PIXEL_MAP_I_TO_I_SIZE; break;
+    case QXP_GL_PIXEL_MAP_S_TO_S:
+        pname = QXP_GL_PIXEL_MAP_S_TO_S_SIZE; break;
+    case QXP_GL_PIXEL_MAP_I_TO_R:
+        pname = QXP_GL_PIXEL_MAP_I_TO_R_SIZE; break;
+    case QXP_GL_PIXEL_MAP_I_TO_G:
+        pname = QXP_GL_PIXEL_MAP_I_TO_G_SIZE; break;
+    case QXP_GL_PIXEL_MAP_I_TO_B:
+        pname = QXP_GL_PIXEL_MAP_I_TO_B_SIZE; break;
+    case QXP_GL_PIXEL_MAP_I_TO_A:
+        pname = QXP_GL_PIXEL_MAP_I_TO_A_SIZE; break;
+    case QXP_GL_PIXEL_MAP_R_TO_R:
+        pname = QXP_GL_PIXEL_MAP_R_TO_R_SIZE; break;
+    case QXP_GL_PIXEL_MAP_G_TO_G:
+        pname = QXP_GL_PIXEL_MAP_G_TO_G_SIZE; break;
+    case QXP_GL_PIXEL_MAP_B_TO_B:
+        pname = QXP_GL_PIXEL_MAP_B_TO_B_SIZE; break;
+    case QXP_GL_PIXEL_MAP_A_TO_A:
+        pname = QXP_GL_PIXEL_MAP_A_TO_A_SIZE; break;
+    default: return 1;
+    }
+    PFN_CALL(glGetIntegerv(pname, &size));
+    return size > 0 ? size : 1;
+}
+
 int wrSizeTexture(const int target, const int level, const int compressed)
 {
     MESA_PFN(PFNGLGETTEXLEVELPARAMETERIVPROC,glGetTexLevelParameteriv);
@@ -219,7 +274,17 @@ const char *getGLFuncStr(int FEnum)
 
 void doMesaFunc(int FEnum, uint32_t *arg, uintptr_t *parg, uintptr_t *ret)
 {
-    int numArgs = getNumArgs(tblMesaGL[FEnum].sym);
+    int numArgs;
+
+    if (FEnum < 0 || FEnum >= FEnum_zzMGLFuncEnum_max ||
+        !tblMesaGL[FEnum].ptr) {
+        if (ret) {
+            *ret = 0;
+        }
+        DPRINTF("unsupported GL function enum %04x", FEnum);
+        return;
+    }
+    numArgs = getNumArgs(tblMesaGL[FEnum].sym);
 
     if (GLFuncTrace()) {
         const char *fstr = getGLFuncStr(FEnum);
@@ -498,6 +563,9 @@ void doMesaFunc(int FEnum, uint32_t *arg, uintptr_t *parg, uintptr_t *ret)
         case FEnum_glGetDoublev:
         case FEnum_glGetFloatv:
         case FEnum_glGetIntegerv:
+        case FEnum_glGetPixelMapfv:
+        case FEnum_glGetPixelMapuiv:
+        case FEnum_glGetPixelMapusv:
         case FEnum_glGetUniformBlockIndex:
         case FEnum_glGetUniformLocation:
         case FEnum_glGetUniformLocationARB:
@@ -654,6 +722,7 @@ void doMesaFunc(int FEnum, uint32_t *arg, uintptr_t *parg, uintptr_t *ret)
         case FEnum_glNormal3iv:
         case FEnum_glNormal3sv:
         case FEnum_glPolygonStipple:
+        case FEnum_glGetPolygonStipple:
         case FEnum_glRasterPos2dv:
         case FEnum_glRasterPos2fv:
         case FEnum_glRasterPos2iv:

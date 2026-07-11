@@ -30,6 +30,7 @@ int MGLUpdateGuestBufo(mapbufo_t *, const int);
 void MGLTmpContext(void);
 void MGLWndRelease(void);
 int MGLMakeCurrent(uint32_t, int);
+void MGLReleaseCurrent(void);
 int MGLSwapBuffers(void);
 int MGLChoosePixelFormat(void);
 int MGLDescribePixelFormat(int, unsigned int, void *);

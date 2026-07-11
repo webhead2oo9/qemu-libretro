@@ -20,8 +20,10 @@
 
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
+#include "hw/core/cpu.h"
 #include "hw/i386/pc.h"
 #include "exec/address-spaces.h"
+#include "ui/console.h"
 
 #include "mesagl_impl.h"
 
@@ -73,6 +75,7 @@ typedef struct MesaPTState
     int pixPackBuf, pixUnpackBuf;
     int szPackWidth, szUnpackWidth;
     int szPackHeight, szUnpackHeight;
+    int unpackAlignment, unpackSkipRows, unpackSkipPixels;
     int queryBuf;
     int arrayBuf;
     int elemArryBuf;
@@ -84,7 +87,143 @@ typedef struct MesaPTState
     int64_t crashRC;
     PERFSTAT perfs;
 
+    /* Explicit single-owner session state. Numeric values are part of the
+     * MESA_PROBE response, so keep FREE/RESERVED/OWNED at 0/1/2. */
+    enum {
+        MESA_SESSION_FREE = 0,
+        MESA_SESSION_RESERVED = 1,
+        MESA_SESSION_OWNED = 2,
+    } session_state;
+    uint16_t holder_token;
+    uint32_t owner_ptm;
+    uint32_t owner_attestation;
+    uint64_t session_generation;
+    int64_t reservation_expiry;
+    QEMUTimer *owner_timer;
+    int64_t owner_heartbeat_expiry;
+    bool owner_heartbeat_enabled;
+    bool owner_tokened;
+
+    struct MesaPTReply {
+        uint32_t mesa_ver;
+        uintptr_t fret;
+        uint32_t pixfmt;
+        uint32_t pixfmt_max;
+        uint32_t proc_ret;
+        bool refused;
+    } *cpu_replies, io_reply;
+    unsigned int cpu_reply_count;
+
 } MesaPTState;
+
+static const uint8_t qxpicd_signature[8] = {
+    'Q', 'X', 'P', 'I', 'C', 'D', 0, MESA_PROBE_VER
+};
+
+static struct MesaPTReply *mesapt_reply_for_cpu(MesaPTState *s)
+{
+    if (current_cpu && current_cpu->cpu_index >= 0 &&
+        (unsigned int)current_cpu->cpu_index < s->cpu_reply_count) {
+        return &s->cpu_replies[current_cpu->cpu_index];
+    }
+    return &s->io_reply;
+}
+
+static void mesapt_session_expire(MesaPTState *s, int64_t now)
+{
+    if (s->session_state == MESA_SESSION_RESERVED &&
+        now >= s->reservation_expiry) {
+        DPRINTF("reservation token %04x expired", s->holder_token);
+        s->session_state = MESA_SESSION_FREE;
+        s->holder_token = 0;
+        s->reservation_expiry = 0;
+    }
+}
+
+static void mesapt_session_release(MesaPTState *s, const char *reason);
+
+static void mesapt_ring_reset(MesaPTState *s)
+{
+    uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
+    uint32_t *dataptr = (uint32_t *)(s->fifo_ptr + (MAX_FIFO << 2));
+
+    fifoptr[0] = FIRST_FIFO;
+    fifoptr[1] = 0;
+    dataptr[0] = ALIGNED(1) >> 2;
+    dataptr[1] = 0;
+}
+
+static void mesapt_session_reclaim(MesaPTState *s, const char *reason)
+{
+    /* Clear the stale guest claim before another process can sniff-share it. */
+    mesapt_ring_reset(s);
+
+    if (s->mglContext) {
+        s->perfs.last();
+        MGLDeleteContext(0);
+        if (s->dispTimer) {
+            timer_del(s->dispTimer);
+            timer_free(s->dispTimer);
+        }
+        s->dispTimer = 0;
+        s->mglContext = 0;
+        s->mglCntxWGL = 0;
+        s->mglCntxCurrent = 0;
+        FreeVertex();
+    }
+    if (s->MesaVer) {
+        MGLWndRelease();
+    }
+    FiniMesaGL();
+    s->MesaVer = 0;
+    s->pixfmt = 0;
+    s->pixfmtMax = 0;
+    s->procRet = 0;
+    s->FRet = 0;
+    mesapt_session_release(s, reason);
+}
+
+static bool mesapt_legacy_owner_expired(MesaPTState *s, int64_t now)
+{
+    return s->session_state == MESA_SESSION_OWNED &&
+           !s->owner_tokened && !s->owner_heartbeat_enabled &&
+           now - s->crashRC > MESAGL_CRASH_RC;
+}
+
+static void mesapt_session_release(MesaPTState *s, const char *reason)
+{
+    if (s->session_state != MESA_SESSION_FREE) {
+        DPRINTF("session %" PRIu64 " released (%s)",
+                s->session_generation, reason);
+    }
+    s->session_state = MESA_SESSION_FREE;
+    s->holder_token = 0;
+    s->owner_ptm = 0;
+    s->owner_attestation = 0;
+    s->reservation_expiry = 0;
+    if (s->owner_timer) {
+        timer_del(s->owner_timer);
+    }
+    s->owner_heartbeat_expiry = 0;
+    s->owner_heartbeat_enabled = false;
+    s->owner_tokened = false;
+    s->mglCntxAtt = 0;
+    mesa_set_session_owned(false);
+}
+
+static uint32_t mesapt_probe_value(MesaPTState *s)
+{
+    uint32_t token;
+
+    mesapt_session_expire(s,
+        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+    /* This arbitration protects cooperating-but-buggy guest clients; it is
+     * not a security boundary.  The token is echoed so a reserver can confirm
+     * its claim, and another guest process could deliberately replay it. */
+    token = s->session_state == MESA_SESSION_FREE ? 0 : s->holder_token;
+    return (MESA_PROBE_TAG << 24) | (MESA_PROBE_VER << 20) |
+           ((uint32_t)s->session_state << 16) | token;
+}
 
 static void vtxarry_init(vtxarry_t *varry, int size, int type, int stride, void *ptr)
 {
@@ -350,14 +489,41 @@ static void InitClientStates(MesaPTState *s)
     s->pixPackBuf = 0; s->pixUnpackBuf = 0;
     s->szPackWidth = 0; s->szUnpackWidth = 0;
     s->szPackHeight = 0; s->szUnpackHeight = 0;
+    s->unpackAlignment = 4;
+    s->unpackSkipRows = 0;
+    s->unpackSkipPixels = 0;
     GLExtUncapped(s->mglCntxWGL);
 }
 
-static void dispTimerProc(void *opaque)
+static uint32_t bitmapDataSize(MesaPTState *s, uint32_t width,
+                               uint32_t height)
+{
+    uint64_t row_bits, row_bytes, stride, last_bytes, total;
+    uint32_t alignment = s->unpackAlignment > 0 ? s->unpackAlignment : 1;
+
+    if (!width || !height) return 0;
+    row_bits = s->szUnpackWidth > 0 ? (uint32_t)s->szUnpackWidth : width;
+    row_bits += s->unpackSkipPixels > 0 ?
+        (uint32_t)s->unpackSkipPixels : 0;
+    row_bytes = (row_bits + 7U) >> 3;
+    stride = (row_bytes + alignment - 1U) & ~(uint64_t)(alignment - 1U);
+    last_bytes = ((uint64_t)width +
+        (s->unpackSkipPixels > 0 ? (uint32_t)s->unpackSkipPixels : 0) + 7U) >> 3;
+    total = (uint64_t)(s->unpackSkipRows > 0 ? s->unpackSkipRows : 0) * stride;
+    total += (uint64_t)(height - 1U) * stride + last_bytes;
+    return total > MGLFBT_SIZE ? MGLFBT_SIZE : (uint32_t)total;
+}
+
+static void dispTimerProcMain(void *opaque)
 {
     MesaPTState *s = opaque;
     s->perfs.last();
     MGLActivateHandler(0, 1);
+}
+
+static void dispTimerProc(void *opaque)
+{
+    qemu_fx_run_on_main_thread(dispTimerProcMain, opaque);
 }
 
 static void dispTimerSched(QEMUTimer *ts, int64_t *crashRC)
@@ -372,28 +538,35 @@ static void dispTimerSched(QEMUTimer *ts, int64_t *crashRC)
 static uint64_t mesapt_read(void *opaque, hwaddr addr, unsigned size)
 {
     MesaPTState *s = opaque;
+    struct MesaPTReply *reply = mesapt_reply_for_cpu(s);
     uint32_t val = 0;
 
     switch (addr) {
+        case 0xFB4:
+            val = mesapt_probe_value(s);
+            break;
         case 0xFB8:
             val = glwnd_ready();
+            if (!val && reply->refused) {
+                val = MESA_BUSY;
+            }
             break;
         case 0xFBC:
-            val = s->MesaVer;
+            val = reply->mesa_ver;
             break;
         case 0xFC0:
-            val = s->FRet;
+            val = reply->fret;
             break;
         case 0xFEC:
-            val = s->pixfmt;
+            val = reply->pixfmt;
             break;
         case 0xFE8:
-            val = s->pixfmtMax;
+            val = reply->pixfmt_max;
             break;
         case 0xFE4:
         case 0xFE0:
-            val = s->procRet;
-            s->procRet = 0;
+            val = reply->proc_ret;
+            reply->proc_ret = 0;
             break;
         default:
             break;
@@ -1000,9 +1173,16 @@ static void processArgs(MesaPTState *s)
         case FEnum_glPolygonStipple:
             s->parg[0] = (s->FEnum == FEnum_glDrawPixels)? s->arg[4]:s->arg[0];
             if (s->pixUnpackBuf == 0) {
-                s->datacb = (s->FEnum == FEnum_glDrawPixels)?
-                    ALIGNED(((s->szUnpackWidth == 0)? s->arg[0]:s->szUnpackWidth) * s->arg[1] * szgldata(s->arg[2], s->arg[3])):
-                    ALIGNED(((s->szUnpackWidth == 0)? 32:s->szUnpackWidth) * 32);
+                if (s->FEnum == FEnum_glDrawPixels) {
+                    s->datacb = ALIGNED(
+                        ((s->szUnpackWidth == 0)? s->arg[0]:s->szUnpackWidth) *
+                        s->arg[1] * szgldata(s->arg[2], s->arg[3]));
+                } else {
+                    s->datacb = s->owner_tokened ?
+                        ALIGNED(bitmapDataSize(s, 32, 32)) :
+                        ALIGNED(((s->szUnpackWidth == 0)?
+                                 32:s->szUnpackWidth) * 32);
+                }
                 s->parg[0] = VAL(s->hshm);
             }
             break;
@@ -1052,6 +1232,9 @@ static void processArgs(MesaPTState *s)
         case FEnum_glSelectBuffer:
             s->parg[1] = VAL(outshm);
             break;
+        case FEnum_glGetPolygonStipple:
+            s->parg[0] = VAL(outshm);
+            break;
         case FEnum_glFeedbackBuffer:
             s->parg[2] = VAL(outshm);
             break;
@@ -1075,7 +1258,18 @@ static void processArgs(MesaPTState *s)
         case FEnum_glGetPixelMapfv:
         case FEnum_glGetPixelMapuiv:
         case FEnum_glGetPixelMapusv:
-            *(int *)outshm = szglname(s->arg[0]);
+            if (s->FEnum == FEnum_glGetPixelMapfv ||
+                s->FEnum == FEnum_glGetPixelMapuiv ||
+                s->FEnum == FEnum_glGetPixelMapusv) {
+                int elements = wrPixelMapSize(s->arg[0]);
+                int element_size = s->FEnum == FEnum_glGetPixelMapusv ?
+                                   sizeof(uint16_t) : sizeof(uint32_t);
+                int maximum = ((3 * PAGE_SIZE) - ALIGNED(sizeof(int))) /
+                              element_size;
+                *(int *)outshm = elements < maximum ? elements : maximum;
+            } else {
+                *(int *)outshm = szglname(s->arg[0]);
+            }
             s->parg[1] = VAL(PTR(outshm, ALIGNED(sizeof(int))));
             break;
         case FEnum_glGetBufferParameteriv:
@@ -1250,17 +1444,18 @@ static void processArgs(MesaPTState *s)
             s->parg[2] = (s->pixPackBuf == 0)? VAL(s->fbtm_ptr):s->arg[6];
             break;
         case FEnum_glRectdv:
-            s->datacb = 2*sizeof(double);
+            s->datacb = 4*sizeof(double);
             s->parg[0] = VAL(s->hshm);
-            s->parg[1] = VAL(PTR(s->hshm, sizeof(double)));
+            s->parg[1] = VAL(PTR(s->hshm, 2*sizeof(double)));
             break;
         case FEnum_glRectfv:
         case FEnum_glRectiv:
-            s->datacb = 2*ALIGNED(sizeof(uint32_t));
+            s->datacb = 4*sizeof(uint32_t);
             s->parg[0] = VAL(s->hshm);
-            s->parg[1] = VAL(PTR(s->hshm, ALIGNED(sizeof(uint32_t))));
+            s->parg[1] = VAL(PTR(s->hshm, 2*sizeof(uint32_t)));
             break;
         case FEnum_glRectsv:
+            /* Each two-short pointer argument occupies one aligned FIFO slot. */
             s->datacb = 2*ALIGNED(sizeof(uint16_t));
             s->parg[0] = VAL(s->hshm);
             s->parg[1] = VAL(PTR(s->hshm, ALIGNED(sizeof(uint16_t))));
@@ -1319,7 +1514,9 @@ static void processArgs(MesaPTState *s)
             s->parg[2] = s->arg[6];
             if (s->pixUnpackBuf == 0) {
                 uint32_t szBmp, *bmpPtr;
-                szBmp = ((s->szUnpackWidth == 0)? s->arg[0]:s->szUnpackWidth) * s->arg[1];
+                szBmp = s->owner_tokened ?
+                    bitmapDataSize(s, s->arg[0], s->arg[1]) :
+                    ((s->szUnpackWidth == 0)? s->arg[0]:s->szUnpackWidth) * s->arg[1];
                 SZFBT_VALID(szBmp, s->arg[6]);
                 bmpPtr = (uint32_t *)(s->fbtm_ptr + (MGLFBT_SIZE - ALIGNED(szBmp)));
                 s->parg[2] = (s->arg[6])? VAL(bmpPtr):0;
@@ -1956,6 +2153,13 @@ static void processFRet(MesaPTState *s)
             s->szPackHeight = (s->arg[0] == GL_PACK_IMAGE_HEIGHT)? s->arg[1]:s->szPackHeight;
             s->szUnpackWidth = (s->arg[0] == GL_UNPACK_ROW_LENGTH)? s->arg[1]:s->szUnpackWidth;
             s->szUnpackHeight = (s->arg[0] == GL_UNPACK_IMAGE_HEIGHT)? s->arg[1]:s->szUnpackHeight;
+            if (s->arg[0] == GL_UNPACK_ALIGNMENT &&
+                (s->arg[1] == 1 || s->arg[1] == 2 ||
+                 s->arg[1] == 4 || s->arg[1] == 8)) {
+                s->unpackAlignment = s->arg[1];
+            }
+            s->unpackSkipRows = (s->arg[0] == GL_UNPACK_SKIP_ROWS)? s->arg[1]:s->unpackSkipRows;
+            s->unpackSkipPixels = (s->arg[0] == GL_UNPACK_SKIP_PIXELS)? s->arg[1]:s->unpackSkipPixels;
             //DPRINTF("PixelStorei %x %x", s->arg[0], s->arg[1]);
             break;
         case FEnum_glFenceSync:
@@ -2210,22 +2414,150 @@ static void ContextCreateCommon(MesaPTState *s)
     ImplMesaGLReset();
 }
 
-static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+typedef struct MesaPTWriteRequest {
+    MesaPTState *s;
+    struct MesaPTReply *reply;
+    hwaddr addr;
+    uint64_t val;
+    unsigned size;
+    bool refused;
+    bool clear_refused;
+} MesaPTWriteRequest;
+
+static void mesapt_snapshot_reply(MesaPTWriteRequest *request)
+{
+    MesaPTState *s = request->s;
+
+    switch (request->addr) {
+    case 0xFBC:
+        request->reply->mesa_ver = s->MesaVer;
+        break;
+    case 0xFC0:
+        request->reply->fret = s->FRet;
+        break;
+    case 0xFEC:
+        request->reply->pixfmt = s->pixfmt;
+        break;
+    case 0xFE8:
+        request->reply->pixfmt_max = s->pixfmtMax;
+        break;
+    case 0xFE4:
+    case 0xFE0:
+        request->reply->proc_ret = s->procRet;
+        s->procRet = 0;
+        break;
+    default:
+        break;
+    }
+
+    if (request->refused) {
+        request->reply->refused = true;
+    } else if (request->clear_refused) {
+        request->reply->refused = false;
+    }
+}
+
+static void ownerHeartbeatProcMain(void *opaque)
+{
+    MesaPTState *s = opaque;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
+    if (!s->owner_heartbeat_enabled ||
+        s->session_state != MESA_SESSION_OWNED) {
+        return;
+    }
+    if (now < s->owner_heartbeat_expiry) {
+        timer_mod(s->owner_timer, s->owner_heartbeat_expiry);
+        return;
+    }
+
+    DPRINTF("session %" PRIu64 " heartbeat expired; reclaiming",
+            s->session_generation);
+
+    mesapt_session_reclaim(s, "heartbeat expiry");
+}
+
+static void ownerHeartbeatProc(void *opaque)
+{
+    qemu_fx_run_on_main_thread(ownerHeartbeatProcMain, opaque);
+}
+
+static void mesapt_write_main(void *opaque)
 {
     COMMIT_SIGN;
-    MesaPTState *s = opaque;
+    MesaPTWriteRequest *request = opaque;
+    MesaPTState *s = request->s;
+    hwaddr addr = request->addr;
+    uint64_t val = request->val;
 
-    if (addr == 0xFBC) {
+    request->refused = false;
+    request->clear_refused = false;
+
+    if (addr == 0xFB0) {
+        uint16_t token = (uint16_t)val;
+
+        if (s->session_state == MESA_SESSION_OWNED && token &&
+            token == s->holder_token && val <= UINT16_MAX) {
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
+            if (!s->owner_heartbeat_enabled) {
+                DPRINTF("session %" PRIu64 " heartbeat enabled token %04x",
+                        s->session_generation, token);
+            }
+            s->owner_heartbeat_enabled = true;
+            s->owner_heartbeat_expiry = now + MESA_HEARTBEAT_TTL;
+            timer_mod(s->owner_timer, s->owner_heartbeat_expiry);
+        }
+    }
+    else if (addr == 0xFB4) {
+        uint32_t token = (uint32_t)val;
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
+        mesapt_session_expire(s, now);
+        if (token && token <= UINT16_MAX &&
+            (s->session_state == MESA_SESSION_FREE ||
+             (s->session_state == MESA_SESSION_RESERVED &&
+              s->holder_token == token))) {
+            if (s->session_state == MESA_SESSION_FREE) {
+                DPRINTF("reserved token %04x", token);
+            }
+            s->session_state = MESA_SESSION_RESERVED;
+            s->holder_token = token;
+            s->reservation_expiry = now + MESA_PROBE_TTL;
+        }
+    }
+    else if (addr == 0xFBC) {
         switch (val) {
             case 0xA0320:
+                if (mesapt_legacy_owner_expired(s,
+                        qemu_clock_get_ms(QEMU_CLOCK_REALTIME))) {
+                    DPRINTF("session %" PRIu64
+                            " legacy crash timeout expired; reclaiming",
+                            s->session_generation);
+                    mesapt_session_reclaim(s, "legacy crash timeout");
+                }
+                mesapt_session_expire(s,
+                    qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+                if (s->session_state == MESA_SESSION_OWNED) {
+                    s->MesaVer = MESA_BUSY;
+                    request->refused = true;
+                    DPRINTF("session %" PRIu64 " refused DLL activation",
+                            s->session_generation);
+                    break;
+                }
                 s->MesaVer = 0;
-                if ((memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1), rev_, ALIGNED(1)) == 0) &&
+                if ((memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
+                            rev_, ALIGNED(1)) == 0 ||
+                     memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
+                            qxpicd_signature,
+                            sizeof(qxpicd_signature)) == 0) &&
                     (InitMesaGL() == 0)) {
                     s->MesaVer = (uint32_t)((val >> 12) & 0xFFU) | ((val & 0xFFFU) << 8);
                     s->mglCntxAtt = 0;
                     MGLTmpContext();
                     DPRINTF("DLL loaded");
                 }
+                request->clear_refused = true;
                 break;
             case 0xD0320:
                 if (s->mglContext) {
@@ -2237,6 +2569,8 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                     DPRINTF("%-64s", "DLL unloaded");
                 }
                 FiniMesaGL();
+                mesapt_session_release(s, "DLL unload");
+                request->clear_refused = true;
                 break;
         }
     }
@@ -2290,6 +2624,17 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 do {
                     uint32_t *ptVer = (uint32_t *)(s->fifo_ptr + (MGLSHM_SIZE - PAGE_SIZE));
                     int level = ((ptVer[0] & 0xFFFFFFF0U) == (MESAGL_MAGIC & 0xFFFFFFF0U))? (MESAGL_MAGIC - ptVer[0]):0;
+                    if (s->owner_tokened && s->mglContext && !ptVer[0]) {
+                        MGLReleaseCurrent();
+                        if (s->dispTimer) {
+                            timer_del(s->dispTimer);
+                            timer_free(s->dispTimer);
+                        }
+                        s->dispTimer = 0;
+                        s->mglCntxCurrent = 0;
+                        DPRINTF("wglReleaseContext cntx %d", s->mglContext);
+                        break;
+                    }
                     if (s->mglContext && !s->mglCntxCurrent && ptVer[0]) {
                         char xYear[8], xLen[8], strTimerMS[8];
                         int disptmr = GetDispTimerMS();
@@ -2330,7 +2675,9 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 break;
             case 0xFF4:
                 DPRINTF("wglDeleteContext cntx %d curr %d lvl %d", s->mglContext, s->mglCntxCurrent, (int)(MESAGL_MAGIC - val));
-                if (s->mglContext && s->mglCntxCurrent && (val == MESAGL_MAGIC)) {
+                if (s->mglContext &&
+                    (s->mglCntxCurrent || s->owner_tokened) &&
+                    (val == MESAGL_MAGIC)) {
                     s->perfs.last();
                     MGLDeleteContext(0);
                     if (s->dispTimer) {
@@ -2346,6 +2693,12 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 }
                 else
                     MGLDeleteContext(MESAGL_MAGIC - val);
+                if (val == MESAGL_MAGIC) {
+                    if (s->owner_tokened) {
+                        mesapt_ring_reset(s);
+                    }
+                    mesapt_session_release(s, "level-0 context delete");
+                }
                 break;
             case 0xFF0:
                 DPRINTF_COND((GLFuncTrace() == 2), ">>>>>>>> wglSwapBuffers <<<<<<<<");
@@ -2373,37 +2726,148 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     GLContextZERO(ctx0); \
     GLBlitFlip(flip); \
     GLDispTimerCfg(msec)
-                do {
-                    uint8_t *ppfd = s->fifo_ptr + (MGLSHM_SIZE - PAGE_SIZE);
-                    PPFD_CONFIG_DISPATCH();
-                } while(0);
-                s->pixfmt = MGLChoosePixelFormat();
+                if (s->session_state == MESA_SESSION_OWNED) {
+                    /* No identity travels with ChoosePixelFormat. Preserve the
+                     * incumbent's established answer without reconfiguring or
+                     * recreating its window; a foreign caller is caught at FE4. */
+                    request->clear_refused = true;
+                } else {
+                    do {
+                        uint8_t *ppfd = s->fifo_ptr + (MGLSHM_SIZE - PAGE_SIZE);
+                        PPFD_CONFIG_DISPATCH();
+                    } while(0);
+                    s->pixfmt = MGLChoosePixelFormat();
+                    request->clear_refused = true;
+                }
                 break;
             case 0xFE8:
-                do {
-                    uint8_t *ppfd = s->fifo_ptr + (MGLSHM_SIZE - PAGE_SIZE);
-                    int pixfmt = *(int *)PTR(ppfd, 2*sizeof(int));
-                    unsigned int nbytes = *(uint32_t *)PTR(ppfd, 3*sizeof(int));
-                    PPFD_CONFIG_DISPATCH();
-                    s->pixfmtMax = ((uint32_t *)s->fifo_ptr)[1]? MGLDescribePixelFormat(pixfmt, nbytes, ppfd):0;
-                } while(0);
+                if (s->session_state == MESA_SESSION_OWNED) {
+                    s->pixfmtMax = 0;
+                    request->refused = true;
+                } else {
+                    do {
+                        uint8_t *ppfd = s->fifo_ptr + (MGLSHM_SIZE - PAGE_SIZE);
+                        int pixfmt = *(int *)PTR(ppfd, 2*sizeof(int));
+                        unsigned int nbytes = *(uint32_t *)PTR(ppfd, 3*sizeof(int));
+                        PPFD_CONFIG_DISPATCH();
+                        s->pixfmtMax = ((uint32_t *)s->fifo_ptr)[1]? MGLDescribePixelFormat(pixfmt, nbytes, ppfd):0;
+                    } while(0);
+                    request->clear_refused = true;
+                }
                 break;
             case 0xFE4:
                 do {
                     int64_t curr_ts = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+                    int64_t reservation_now =
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
                     uint8_t *ppfd = s->fifo_ptr + (MGLSHM_SIZE - PAGE_SIZE);
                     int pixfmt = *(int *)ppfd;
-                    int ptm = *(int *)PTR(ppfd, sizeof(int));
+                    uint32_t ptm = *(uint32_t *)PTR(ppfd, sizeof(int));
+                    uint32_t normalized_ptm = ptm & 0xFFFFF000U;
+                    uint32_t token = *(uint32_t *)PTR(ppfd,
+                                                      12 * sizeof(uint32_t));
+                    uint32_t *dataptr = (uint32_t *)(s->fifo_ptr +
+                                                     (MAX_FIFO << 2));
+                    uint32_t ring_refcount = dataptr[1];
+                    bool was_free;
+                    bool tokened_grant;
+                    bool grant;
+
+                    if (mesapt_legacy_owner_expired(s, curr_ts)) {
+                        DPRINTF("session %" PRIu64
+                                " legacy crash timeout expired at"
+                                " SetPixelFormat; releasing",
+                                s->session_generation);
+                        /* Preserve the initialized legacy Mesa/window state so
+                         * the historical warp path below can rebind its ring. */
+                        mesapt_session_release(s, "legacy crash timeout");
+                    }
+                    mesapt_session_expire(s, reservation_now);
+                    was_free = s->session_state == MESA_SESSION_FREE;
+                    tokened_grant =
+                        s->session_state == MESA_SESSION_RESERVED &&
+                        token == s->holder_token;
+                    grant = was_free ||
+                        tokened_grant ||
+                        (s->session_state == MESA_SESSION_OWNED &&
+                         normalized_ptm == s->owner_ptm &&
+                         ring_refcount <= 1);
+                    if (!grant) {
+                        s->procRet = 0;
+                        request->refused = true;
+                        DPRINTF("session %" PRIu64
+                                " refused SetPixelFormat ptm %08x token %04x"
+                                " refcnt %u",
+                                s->session_generation, normalized_ptm,
+                                token & UINT16_MAX, ring_refcount);
+                        break;
+                    }
+                    if (tokened_grant) {
+                        uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
+
+                        /* The ICD never sniffs or claims a legacy ring. Build a
+                         * fresh claim only after its reservation token wins. */
+                        fifoptr[0] = FIRST_FIFO;
+                        fifoptr[1] = ptm + 0xFC0U;
+                        dataptr[0] = ALIGNED(1) >> 2;
+                        dataptr[1] = 1;
+                    }
                     s->procRet = MGLSetPixelFormat(pixfmt, PTR(ppfd, ALIGNED(sizeof(int))))?
                         (((uint32_t*)s->fifo_ptr)[1]? MESAGL_MAGIC:0):0;
-                    if ((curr_ts - s->crashRC) > MESAGL_CRASH_RC) {
-                        uint32_t *fifoptr = (uint32_t *)s->fifo_ptr,
-                                 *dataptr = (uint32_t *)(s->fifo_ptr + (MAX_FIFO << 2));
-                        if ((fifoptr[1] & 0xFFFFF000U) != ptm) {
-                            DPRINTF("..warped %08x-%08x", fifoptr[1] & 0xFFFFF000U, ptm);
-                            fifoptr[1] = (fifoptr[1] & 0xFFFU) | ptm;
+                    if (s->procRet == MESAGL_MAGIC &&
+                        s->session_state != MESA_SESSION_OWNED) {
+                        int64_t owner_now =
+                            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+
+                        s->owner_ptm = normalized_ptm;
+                        s->owner_attestation = s->mglCntxAtt;
+                        s->owner_tokened = tokened_grant;
+                        /* Start a tokened lease at bind, rather than waiting
+                         * for the heartbeat worker's first scheduling slice.
+                         * A client killed in that interval must still expire. */
+                        s->owner_heartbeat_enabled = tokened_grant;
+                        s->owner_heartbeat_expiry = tokened_grant ?
+                            owner_now + MESA_HEARTBEAT_TTL : 0;
+                        if (tokened_grant) {
+                            timer_mod(s->owner_timer,
+                                      s->owner_heartbeat_expiry);
+                        }
+                        s->session_generation++;
+                        s->session_state = MESA_SESSION_OWNED;
+                        s->reservation_expiry = 0;
+                        mesa_set_session_owned(true);
+                        DPRINTF("session %" PRIu64
+                                " bound ptm %08x token %04x",
+                                s->session_generation, s->owner_ptm,
+                                s->holder_token);
+                    }
+                    if (s->procRet == MESAGL_MAGIC && was_free &&
+                        (curr_ts - s->crashRC) > MESAGL_CRASH_RC) {
+                        uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
+                        if ((fifoptr[1] & 0xFFFFF000U) != normalized_ptm) {
+                            DPRINTF("..warped %08x-%08x",
+                                    fifoptr[1] & 0xFFFFF000U,
+                                    normalized_ptm);
+                            fifoptr[1] = (fifoptr[1] & 0xFFFU) |
+                                         normalized_ptm;
                         }
                         DPRINTF_COND((dataptr[1] > 1), "..reset refcnt %04x", dataptr[1]--);
+                    }
+                    if (s->procRet == MESAGL_MAGIC) {
+                        s->crashRC = curr_ts;
+                    }
+                    if (s->procRet == MESAGL_MAGIC) {
+                        request->clear_refused = true;
+                    } else {
+                        if (tokened_grant) {
+                            uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
+
+                            fifoptr[0] = FIRST_FIFO;
+                            fifoptr[1] = 0;
+                            dataptr[0] = ALIGNED(1) >> 2;
+                            dataptr[1] = 0;
+                        }
+                        request->refused = true;
                     }
                 } while(0);
                 break;
@@ -2461,6 +2925,21 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     else
         DPRINTF("  *WARN* Unhandled mesapt_write(), addr %08x val %08x", (uint32_t)addr, (uint32_t)val);
+
+    mesapt_snapshot_reply(request);
+}
+
+static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    MesaPTWriteRequest request = {
+        .s = opaque,
+        .reply = mesapt_reply_for_cpu(opaque),
+        .addr = addr,
+        .val = val,
+        .size = size,
+    };
+
+    qemu_fx_run_on_main_thread(mesapt_write_main, &request);
 }
 
 static const MemoryRegionOps mesapt_ops = {
@@ -2475,7 +2954,14 @@ static const MemoryRegionOps mesapt_ops = {
 
 static void mesapt_reset(DeviceState *d)
 {
-    //MesaPTState *s = MESAPT(d);
+    MesaPTState *s = MESAPT(d);
+
+    mesapt_session_release(s, "device reset");
+    if (s->cpu_replies) {
+        memset(s->cpu_replies, 0,
+               s->cpu_reply_count * sizeof(*s->cpu_replies));
+    }
+    memset(&s->io_reply, 0, sizeof(s->io_reply));
 }
 
 static void mesapt_init(Object *obj)
@@ -2492,18 +2978,37 @@ static void mesapt_init(Object *obj)
     memory_region_add_subregion(sysmem, MESA_FBTM_BASE, &s->fbtm_ram);
 
     memory_region_init_io(&s->iomem, obj, &mesapt_ops, s, TYPE_MESAPT, PAGE_SIZE);
+    /* A doorbell callback waits for main-loop GL dispatch with the BQL
+     * released.  Let another vCPU enter the register bank during that wait;
+     * BQL/main-loop serialization still protects device-state mutation. */
+    s->iomem.disable_reentrancy_guard = true;
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
 static void mesapt_realize(DeviceState *dev, Error **errp)
 {
     MesaPTState *s = MESAPT(dev);
+
+    s->cpu_reply_count = current_machine ?
+        MAX(1U, current_machine->smp.max_cpus) : 1;
+    s->cpu_replies = g_new0(struct MesaPTReply, s->cpu_reply_count);
+    s->owner_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                  ownerHeartbeatProc, s);
     mesastat(&s->perfs);
 }
 
 static void mesapt_finalize(Object *obj)
 {
-    //MesaPTState *s = MESAPT(obj);
+    MesaPTState *s = MESAPT(obj);
+
+    mesapt_session_release(s, "device finalize");
+    if (s->owner_timer) {
+        timer_free(s->owner_timer);
+        s->owner_timer = NULL;
+    }
+    g_free(s->cpu_replies);
+    s->cpu_replies = NULL;
+    s->cpu_reply_count = 0;
 }
 
 static void mesapt_class_init(ObjectClass *klass, void *data)

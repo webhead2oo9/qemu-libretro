@@ -1,5 +1,15 @@
 /packagecache
 
+# Meson fallback sources and wrap files downloaded for local cross-builds.
+/glib-*
+/libffi
+/pcre2-*
+/proxy-libintl
+/zlib-*
+/gvdb.wrap
+/pcre2.wrap
+/zlib.wrap
+
 /berkeley-softfloat-3
 /berkeley-testfloat-3
 /dtc

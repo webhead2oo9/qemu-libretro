@@ -275,9 +275,9 @@ static int MGLWindowInit(void)
     ImplMesaGLReset();
     mesa_prepare_window(GetContextMSAA(), GLon12, 0, &cwnd_mesagl);
 
-    /* qemu-libretro can deny activation and pause a multi-vCPU VM. The
-     * temporary discovery window still lives in hwnd, so never recover a DC
-     * from it here: only cwnd_mesagl may publish a ready render window/DC. */
+    /* qemu-libretro marshals this callback and all other host GL work onto
+     * its main-loop thread so the WGL context keeps stable thread affinity
+     * under SMP. Only cwnd_mesagl may publish a ready render window/DC. */
     return hDC && qatomic_read(&wnd_ready);
 }
 
@@ -367,6 +367,11 @@ int MGLMakeCurrent(uint32_t cntxRC, int level)
         wglFuncs.MakeCurrent(hPBDC[i], hPBRC[i]);
 
     return 0;
+}
+
+void MGLReleaseCurrent(void)
+{
+    wglFuncs.MakeCurrent(NULL, NULL);
 }
 
 int MGLSwapBuffers(void)

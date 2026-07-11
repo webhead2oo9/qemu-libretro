@@ -16,6 +16,11 @@ typedef struct {
 #define PAGE_SIZE       0x1000
 
 #define MESAGL_MAGIC    0x5b5eb5e5
+#define MESA_BUSY       0xb5b5b5b5
+#define MESA_PROBE_TAG  0x3d
+#define MESA_PROBE_VER  1
+#define MESA_PROBE_TTL  2000
+#define MESA_HEARTBEAT_TTL 5000
 #define MESAGL_HWNDC    0x574e4443
 #define MESAGL_HPBDC    0x50424443
 #define MESA_FIFO_BASE  0xec000000

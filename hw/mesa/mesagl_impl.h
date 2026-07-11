@@ -33,6 +33,7 @@ void *GLFEnumFuncPtr(const int);
 int ExtFuncIsValid(const char *);
 int GLIsD3D12(void);
 int wrMapOrderPoints(uint32_t);
+int wrPixelMapSize(uint32_t);
 int wrSizeTexture(const int, const int, const int);
 int wrSizeMapBuffer(const int);
 void wrCompileShaderStatus(const int);

@@ -346,11 +346,11 @@ not in the RetroArch folder:
   drops stale ones, so latency can increase temporarily under heavy GPU load
   instead of stalling guest execution and audio. Capture also stops while the
   frontend is not calling `retro_run` and resumes with a current frame.
-- qemu-3dfx pass-through requires a single virtual CPU. Because host OpenGL
-  calls run on the vCPU thread, a multi-vCPU VM could access one WGL context
-  from different host threads. The core pauses before 3D activation and shows
-  an error when `-smp` permits more than one CPU; remove `-smp` or use
-  `-smp 1`, then restart the content. Non-3D VMs are unaffected.
+- Multi-vCPU guests are supported. The core synchronously marshals qemu-3dfx
+  GL/WGL commands onto its main-loop thread, so one host context never migrates
+  between vCPU threads. Mesa pass-through remains a single-owner resource:
+  another guest 3D client is refused without replacing the owner's window or
+  pixel format, and can retry after the owner releases the session.
 - 3D modes can grow the frontend geometry dynamically through 3840x2160. A
   larger or invalid mode is rejected before creating a host window or capture
   buffers, and the VM pauses with an error instead of clipping the frame or

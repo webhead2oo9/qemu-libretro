@@ -485,6 +485,7 @@ int glide_gui_fullscreen(int *, int *);
 void glide_renderer_stat(const int);
 
 void mesa_renderer_stat(const int);
+void mesa_set_session_owned(bool owned);
 void mesa_prepare_window(int, int, int, void *);
 void mesa_release_window(void);
 void mesa_cursor_define(int, int, int, int, const void *);
@@ -502,10 +503,19 @@ void glide_swap_notify(void);
 void mesa_swap_notify(int top_down);
 
 /*
+ * Run a qemu-3dfx device command synchronously on the display/main-loop
+ * thread. Device MMIO handlers use this for every host GL/WGL call so an SMP
+ * guest cannot migrate one host context between vCPU threads. The caller
+ * holds the BQL; the implementation drops it while waiting for the queued
+ * command and reacquires it before returning.
+ */
+void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque);
+
+/*
  * Frame sink registered by the display frontend (ui/libretro.c) so the
  * glue can deliver frames it read out of the pass-through GL context.
- * All hooks run with the BQL held, on whichever thread the device's
- * MMIO handler or timer ran on.
+ * All hooks run with the BQL held. Host GL work is marshalled to the
+ * display/main-loop thread by qemu_fx_run_on_main_thread().
  */
 typedef struct QemuFxSink {
     /* BGRA rows, width * height * 4 bytes. Rows are bottom-up

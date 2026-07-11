@@ -17,15 +17,16 @@
  *    pushed to the QemuFxSink the libretro frontend registered, which
  *    publishes it in place of the VGA surface.
  *
- * Everything here runs under the BQL, on the vCPU thread that hit the
- * device MMIO handler (or a QEMU timer for deferred deactivation); the
- * pass-through GL context is only ever current on the vCPU thread.
+ * Device MMIO handlers synchronously marshal every host GL/WGL command to
+ * the main-loop thread. This keeps a pass-through context on one Windows
+ * thread even when an SMP guest submits from different vCPUs.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 #include "hw/boards.h"
 #include "sysemu/runstate.h"
 #include "ui/console.h"
@@ -58,6 +59,16 @@
  * and every readback stalls a vCPU that holds the BQL. */
 #define FX_CAPTURE_MIN_US 8000
 
+typedef struct QemuFxDispatchRequest {
+    QTAILQ_ENTRY(QemuFxDispatchRequest) next;
+    void (*fn)(void *opaque);
+    void *opaque;
+    bool done;
+} QemuFxDispatchRequest;
+
+typedef QTAILQ_HEAD(QemuFxDispatchQueue, QemuFxDispatchRequest)
+    QemuFxDispatchQueue;
+
 static struct {
     const QemuFxSink *sink;
     HWND hwnd;
@@ -65,6 +76,7 @@ static struct {
     bool class_registered;
     uint32_t glide_res;      /* packed ((h & 0x7FFF) << 16) | w */
     bool glide_ready;
+    bool mesa_session_owned;
     void *readback;
     int64_t last_capture_us;
     int pub_width, pub_height;  /* geometry of the last published frame */
@@ -82,7 +94,6 @@ static struct {
     uint32_t frontend_frame_count;
     int64_t frontend_last_seen_us;
     bool frontend_idle;
-    bool smp_error_reported;
     bool geometry_error_reported;
     bool pbo_broken;            /* no PBO support, or it errored: stay
                                  * on the synchronous path for good */
@@ -98,13 +109,58 @@ static struct {
     void *(WINAPI *glFenceSync)(unsigned, unsigned);
     unsigned (WINAPI *glClientWaitSync)(void *, unsigned, uint64_t);
     void (WINAPI *glDeleteSync)(void *);
+    QemuThread dispatch_thread;
+    QemuCond dispatch_cond;
+    QEMUBH *dispatch_bh;
+    QemuFxDispatchQueue dispatch_queue;
+    bool dispatch_initialized;
 } fx;
+
+static void qemu_fx_dispatch_bh(void *opaque)
+{
+    QemuFxDispatchRequest *request;
+
+    (void)opaque;
+    while ((request = QTAILQ_FIRST(&fx.dispatch_queue)) != NULL) {
+        QTAILQ_REMOVE(&fx.dispatch_queue, request, next);
+        request->fn(request->opaque);
+        request->done = true;
+        qemu_cond_broadcast(&fx.dispatch_cond);
+    }
+}
+
+void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque)
+{
+    QemuFxDispatchRequest request = {
+        .fn = fn,
+        .opaque = opaque,
+    };
+
+    if (!fx.dispatch_initialized ||
+        qemu_thread_is_self(&fx.dispatch_thread)) {
+        fn(opaque);
+        return;
+    }
+
+    g_assert(bql_locked());
+    QTAILQ_INSERT_TAIL(&fx.dispatch_queue, &request, next);
+    qemu_bh_schedule(fx.dispatch_bh);
+    while (!request.done) {
+        qemu_cond_wait_bql(&fx.dispatch_cond);
+    }
+}
 
 void qemu_fx_register_sink(const QemuFxSink *sink)
 {
     fx.sink = sink;
-    fx.smp_error_reported = false;
     fx.geometry_error_reported = false;
+    if (!fx.dispatch_initialized) {
+        qemu_thread_get_self(&fx.dispatch_thread);
+        qemu_cond_init(&fx.dispatch_cond);
+        QTAILQ_INIT(&fx.dispatch_queue);
+        fx.dispatch_bh = qemu_bh_new(qemu_fx_dispatch_bh, NULL);
+        fx.dispatch_initialized = true;
+    }
 }
 
 static bool fx_gl_resolve(void)
@@ -257,31 +313,6 @@ static void fx_set_active(bool on)
     if (fx.sink && fx.sink->set_active) {
         fx.sink->set_active(on);
     }
-}
-
-/* The qemu-3dfx devices issue host GL calls directly from the vCPU thread that
- * handled their MMIO. A WGL context cannot migrate safely between multiple
- * vCPU threads without dedicated render-thread marshalling, so stop before a
- * context/window exists rather than allowing intermittent host-driver access.
- * Check max_cpus as well as online CPUs so later CPU hotplug cannot invalidate
- * a context that was safe when it was created. */
-static bool fx_3d_activation_allowed(void)
-{
-    unsigned int cpus;
-
-    if (!current_machine || current_machine->smp.max_cpus <= 1) {
-        return true;
-    }
-
-    cpus = current_machine->smp.max_cpus;
-    if (!fx.smp_error_reported) {
-        error_report("qemu-3dfx requires one virtual CPU; this VM permits "
-                     "%u. The VM was paused before 3D activation. Remove "
-                     "-smp or use -smp 1, then restart the content", cpus);
-        fx.smp_error_reported = true;
-    }
-    vm_stop(RUN_STATE_INTERNAL_ERROR);
-    return false;
 }
 
 /* Windows may return 1, 2, 3, or -1 for an unsupported extension symbol,
@@ -709,15 +740,22 @@ void mesa_prepare_window(int msaa, int alpha, int scale_x, void *cwnd_fn)
     void (*cwnd)(void *, void *, void *) = cwnd_fn;
     int w, h;
 
-    fx_window_destroy();
-    if (!fx_3d_activation_allowed()) {
+    if (fx.mesa_session_owned && fx.hwnd) {
+        warn_report_once("qemu-3dfx: ignored a render-window replacement "
+                         "while the Mesa session is owned");
         return;
     }
+    fx_window_destroy();
     fx_guest_dims(&w, &h);
     if (!fx_window_create(w, h)) {
         return;         /* wnd_ready stays 0; the guest keeps polling */
     }
     cwnd(NULL, fx.hwnd, NULL);
+}
+
+void mesa_set_session_owned(bool owned)
+{
+    fx.mesa_session_owned = owned;
 }
 
 void mesa_release_window(void)
@@ -774,9 +812,6 @@ void glide_prepare_window(uint32_t res, int msaa, void *opaque,
 
     fx_window_destroy();
     fx.glide_ready = false;
-    if (!fx_3d_activation_allowed()) {
-        return;
-    }
     if (!w || !h) {
         w = 640;
         h = 480;

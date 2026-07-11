@@ -934,10 +934,20 @@ static void processFifo(GlidePTState *s)
     }
 }
 
-static void glidept_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+typedef struct GlidePTWriteRequest {
+    GlidePTState *s;
+    hwaddr addr;
+    uint64_t val;
+    unsigned size;
+} GlidePTWriteRequest;
+
+static void glidept_write_main(void *opaque)
 {
     COMMIT_SIGN;
-    GlidePTState *s = opaque;
+    GlidePTWriteRequest *request = opaque;
+    GlidePTState *s = request->s;
+    hwaddr addr = request->addr;
+    uint64_t val = request->val;
 
     switch (addr) {
 	case 0xfb0:
@@ -1017,6 +1027,18 @@ static void glidept_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
         default:
             break;
     }
+}
+
+static void glidept_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    GlidePTWriteRequest request = {
+        .s = opaque,
+        .addr = addr,
+        .val = val,
+        .size = size,
+    };
+
+    qemu_fx_run_on_main_thread(glidept_write_main, &request);
 }
 
 static hwaddr translateLfb(const hwaddr offset_in, const int stride)
