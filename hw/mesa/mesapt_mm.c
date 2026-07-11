@@ -2489,6 +2489,11 @@ static void mesapt_write_main(void *opaque)
     MesaPTState *s = request->s;
     hwaddr addr = request->addr;
     uint64_t val = request->val;
+    uint64_t activity_generation = s->session_generation;
+    bool owner_activity =
+        addr >= 0xFC0 && addr <= 0xFFC &&
+        s->session_state == MESA_SESSION_OWNED &&
+        s->owner_heartbeat_enabled;
 
     request->refused = false;
     request->clear_refused = false;
@@ -2925,6 +2930,22 @@ static void mesapt_write_main(void *opaque)
     }
     else
         DPRINTF("  *WARN* Unhandled mesapt_write(), addr %08x val %08x", (uint32_t)addr, (uint32_t)val);
+
+    /*
+     * A synchronous host GL call can legitimately run longer than the lease
+     * TTL (cold texture upload and shader/driver initialization are common).
+     * If an unreclaimed owner completes an accepted command, completion is
+     * itself liveness evidence. Renew after dispatch so a delayed timer cannot
+     * reclaim the context before the guest gets another scheduling slice.
+     */
+    if (owner_activity && !request->refused &&
+        s->session_generation == activity_generation &&
+        s->session_state == MESA_SESSION_OWNED &&
+        s->owner_heartbeat_enabled) {
+        s->owner_heartbeat_expiry =
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + MESA_HEARTBEAT_TTL;
+        timer_mod(s->owner_timer, s->owner_heartbeat_expiry);
+    }
 
     mesapt_snapshot_reply(request);
 }
