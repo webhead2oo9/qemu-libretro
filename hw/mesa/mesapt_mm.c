@@ -120,6 +120,10 @@ static const uint8_t qxpicd_signature[8] = {
     'Q', 'X', 'P', 'I', 'C', 'D', 0, MESA_PROBE_VER
 };
 
+static const uint8_t qxpd3d_signature[8] = {
+    'Q', 'X', 'P', 'D', '3', 'D', 0, MESA_PROBE_VER
+};
+
 static struct MesaPTReply *mesapt_reply_for_cpu(MesaPTState *s)
 {
     if (current_cpu && current_cpu->cpu_index >= 0 &&
@@ -542,6 +546,12 @@ static uint64_t mesapt_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t val = 0;
 
     switch (addr) {
+        case 0xFA8:
+            /* The XPDM Direct3D client cannot safely consume per-vCPU reply
+             * latches. Activation is globally serialized by reservation, so
+             * expose only its global completion value here. */
+            val = s->MesaVer;
+            break;
         case 0xFB4:
             val = mesapt_probe_value(s);
             break;
@@ -2555,7 +2565,10 @@ static void mesapt_write_main(void *opaque)
                             rev_, ALIGNED(1)) == 0 ||
                      memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
                             qxpicd_signature,
-                            sizeof(qxpicd_signature)) == 0) &&
+                            sizeof(qxpicd_signature)) == 0 ||
+                     memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
+                            qxpd3d_signature,
+                            sizeof(qxpd3d_signature)) == 0) &&
                     (InitMesaGL() == 0)) {
                     s->MesaVer = (uint32_t)((val >> 12) & 0xFFU) | ((val & 0xFFFU) << 8);
                     s->mglCntxAtt = 0;
