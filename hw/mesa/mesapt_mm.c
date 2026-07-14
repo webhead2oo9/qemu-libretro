@@ -32,6 +32,9 @@
 #define MESAPT(obj) \
     OBJECT_CHECK(MesaPTState, (obj), TYPE_MESAPT)
 
+#define MESAPT_PROFILE_FENUM_MAX 0x800
+#define MESAPT_PROFILE_TOP 8
+
 #ifdef DEBUG_MESAPT
 #define DPRINTF(fmt, ...) \
     do { fprintf(stderr, "mesapt: " fmt "\n" , ## __VA_ARGS__); } while(0)
@@ -87,6 +90,16 @@ typedef struct MesaPTState
     int64_t crashRC;
     PERFSTAT perfs;
 
+    /* Low-overhead cumulative timing for pass-through doorbells.  Keeping
+     * this in the device state avoids per-call logging perturbing games while
+     * still identifying the synchronous GL functions that dominate a run. */
+    uint64_t profile_direct_us[MESAPT_PROFILE_FENUM_MAX];
+    uint32_t profile_direct_calls[MESAPT_PROFILE_FENUM_MAX];
+    uint64_t profile_publish_us;
+    uint64_t profile_swap_us;
+    uint32_t profile_publish_calls;
+    uint32_t profile_swap_calls;
+
     /* Explicit single-owner session state. Numeric values are part of the
      * MESA_PROBE response, so keep FREE/RESERVED/OWNED at 0/1/2. */
     enum {
@@ -115,6 +128,77 @@ typedef struct MesaPTState
     unsigned int cpu_reply_count;
 
 } MesaPTState;
+
+static void mesapt_profile_reset(MesaPTState *s)
+{
+    memset(s->profile_direct_us, 0, sizeof(s->profile_direct_us));
+    memset(s->profile_direct_calls, 0, sizeof(s->profile_direct_calls));
+    s->profile_publish_us = 0;
+    s->profile_swap_us = 0;
+    s->profile_publish_calls = 0;
+    s->profile_swap_calls = 0;
+}
+
+static void mesapt_profile_dump(MesaPTState *s)
+{
+    uint32_t selected[MESAPT_PROFILE_TOP];
+    uint64_t direct_total_us = 0;
+    uint64_t best_us;
+    uint32_t direct_total_calls = 0;
+    uint32_t best = 0;
+
+    for (unsigned int rank = 0; rank < MESAPT_PROFILE_TOP; rank++) {
+        selected[rank] = UINT32_MAX;
+    }
+    for (uint32_t i = 0; i < MESAPT_PROFILE_FENUM_MAX; i++) {
+        direct_total_us += s->profile_direct_us[i];
+        direct_total_calls += s->profile_direct_calls[i];
+    }
+    DPRINTF("DoorbellProfile publish calls %u total %" PRIu64
+            " us avg %" PRIu64 " us",
+            s->profile_publish_calls, s->profile_publish_us,
+            s->profile_publish_calls ?
+                s->profile_publish_us / s->profile_publish_calls : 0);
+    DPRINTF("DoorbellProfile swap calls %u total %" PRIu64
+            " us avg %" PRIu64 " us",
+            s->profile_swap_calls, s->profile_swap_us,
+            s->profile_swap_calls ?
+                s->profile_swap_us / s->profile_swap_calls : 0);
+    DPRINTF("DoorbellProfile direct calls %u total %" PRIu64 " us",
+            direct_total_calls, direct_total_us);
+    for (unsigned int rank = 0; rank < MESAPT_PROFILE_TOP; rank++) {
+        const char *name;
+
+        best_us = 0;
+        best = UINT32_MAX;
+        for (uint32_t i = 0; i < MESAPT_PROFILE_FENUM_MAX; i++) {
+            bool already_selected = false;
+
+            for (unsigned int previous = 0; previous < rank; previous++) {
+                if (selected[previous] == i) {
+                    already_selected = true;
+                    break;
+                }
+            }
+            if (!already_selected && s->profile_direct_calls[i] &&
+                (best == UINT32_MAX || s->profile_direct_us[i] > best_us)) {
+                best = i;
+                best_us = s->profile_direct_us[i];
+            }
+        }
+        if (best == UINT32_MAX) {
+            break;
+        }
+        selected[rank] = best;
+        name = getGLFuncStr(best);
+        DPRINTF("DoorbellProfile direct %s(0x%03x) calls %u total %" PRIu64
+                " us avg %" PRIu64 " us",
+                name ? name : "unknown", best,
+                s->profile_direct_calls[best], s->profile_direct_us[best],
+                s->profile_direct_us[best] /
+                    s->profile_direct_calls[best]);
+    }
+}
 
 static const uint8_t qxpicd_signature[8] = {
     'Q', 'X', 'P', 'I', 'C', 'D', 0, MESA_PROBE_VER
@@ -164,6 +248,7 @@ static void mesapt_session_reclaim(MesaPTState *s, const char *reason)
 
     if (s->mglContext) {
         s->perfs.last();
+        mesapt_profile_dump(s);
         MGLDeleteContext(0);
         if (s->dispTimer) {
             timer_del(s->dispTimer);
@@ -2429,6 +2514,7 @@ static void ContextCreateCommon(MesaPTState *s)
     InitSyncObj();
     InitClientStates(s);
     ImplMesaGLReset();
+    mesapt_profile_reset(s);
 }
 
 typedef struct MesaPTWriteRequest {
@@ -2511,6 +2597,12 @@ static void mesapt_write_main(void *opaque)
         addr >= 0xFC0 && addr <= 0xFFC &&
         s->session_state == MESA_SESSION_OWNED &&
         s->owner_heartbeat_enabled;
+    int64_t profile_start_us = 0;
+
+    if (addr == 0xFC0 ||
+        (val == MESAGL_MAGIC && (addr == 0xFD4 || addr == 0xFF0))) {
+        profile_start_us = g_get_monotonic_time();
+    }
 
     request->refused = false;
     request->clear_refused = false;
@@ -2704,6 +2796,7 @@ static void mesapt_write_main(void *opaque)
                     (s->mglCntxCurrent || s->owner_tokened) &&
                     (val == MESAGL_MAGIC)) {
                     s->perfs.last();
+                    mesapt_profile_dump(s);
                     MGLDeleteContext(0);
                     if (s->dispTimer) {
                         timer_del(s->dispTimer);
@@ -2957,6 +3050,27 @@ static void mesapt_write_main(void *opaque)
     }
     else
         DPRINTF("  *WARN* Unhandled mesapt_write(), addr %08x val %08x", (uint32_t)addr, (uint32_t)val);
+
+    if (profile_start_us) {
+        uint64_t elapsed_us = g_get_monotonic_time() - profile_start_us;
+
+        if (addr == 0xFC0 && val < MESAPT_PROFILE_FENUM_MAX) {
+            s->profile_direct_us[val] += elapsed_us;
+            if (s->profile_direct_calls[val] != UINT32_MAX) {
+                s->profile_direct_calls[val]++;
+            }
+        } else if (addr == 0xFD4) {
+            s->profile_publish_us += elapsed_us;
+            if (s->profile_publish_calls != UINT32_MAX) {
+                s->profile_publish_calls++;
+            }
+        } else if (addr == 0xFF0) {
+            s->profile_swap_us += elapsed_us;
+            if (s->profile_swap_calls != UINT32_MAX) {
+                s->profile_swap_calls++;
+            }
+        }
+    }
 
     /*
      * A synchronous host GL call can legitimately run longer than the lease
