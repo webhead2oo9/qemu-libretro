@@ -546,6 +546,13 @@ static uint64_t mesapt_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t val = 0;
 
     switch (addr) {
+        case 0xFA4:
+            /* The kernel XPDM Direct3D transport serializes result-bearing
+             * calls globally through VideoPortSynchronizeExecution.  Return
+             * the completed GL value without depending on which vCPU runs
+             * the following MMIO load. */
+            val = (uint32_t)s->FRet;
+            break;
         case 0xFA8:
             /* The XPDM Direct3D client cannot safely consume per-vCPU reply
              * latches. Activation is globally serialized by reservation, so
