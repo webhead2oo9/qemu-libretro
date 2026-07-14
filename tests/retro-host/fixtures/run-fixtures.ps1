@@ -6,6 +6,8 @@ golden strings documented in each fixture's header.
 Fixtures (see the .S headers for the letter meanings):
   revorder_boot  golden LSBO2RFAT  reverse-launch-order refusal
   fwdorder_boot  golden LBRD1WT    forward refusal + crash succession
+  smpstress_boot golden LICWPFT    concurrent two-vCPU doorbell stress,
+                                   run under tcg,thread=multi AND whpx
 
 Requires:
   - WSL with GNU as/ld (binutils) for the boot-sector build
@@ -39,21 +41,33 @@ if (-not $env:RETRO_HOST_SYSTEM_DIR) {
           'with qemu firmware (e.g. <RetroArch>\system)'
 }
 
+$defaultAccel = '-accel tcg,thread=single'
 $fixtures = @(
-    @{ Name = 'revorder'; Port = 23531; Golden = 'LSBO2RFAT'; Wait = 0 },
-    @{ Name = 'fwdorder'; Port = 23532; Golden = 'LBRD1WT'; Wait = 9000 }
+    @{ Name = 'revorder'; Src = 'revorder'; Port = 23531;
+       Golden = 'LSBO2RFAT'; Wait = 0 },
+    @{ Name = 'fwdorder'; Src = 'fwdorder'; Port = 23532;
+       Golden = 'LBRD1WT'; Wait = 9000 },
+    @{ Name = 'smpstress-tcg'; Src = 'smpstress'; Port = 23533;
+       Golden = 'LICWPFT'; Wait = 20000;
+       Accel = '-accel tcg,thread=multi' },
+    @{ Name = 'smpstress-whpx'; Src = 'smpstress'; Port = 23534;
+       Golden = 'LICWPFT'; Wait = 20000;
+       Accel = '-accel whpx,ssd=off -accel tcg' }
 )
 
 $failures = 0
 foreach ($f in $fixtures) {
     $name = $f.Name
+    $src = $f.Src
+    $accel = $defaultAccel
+    if ($f.Accel) { $accel = $f.Accel }
     $dir = Join-Path $WorkDir $name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
     $wslDir = (wsl -e wslpath -a ($dir -replace '\\', '/')).Trim()
     if ($LASTEXITCODE -ne 0) { throw "wslpath failed for $dir" }
     wsl --cd $repo -e sh -c ("as --32 -o '$wslDir/${name}_boot.o' " +
-        "tests/retro-host/fixtures/${name}_boot.S && " +
+        "tests/retro-host/fixtures/${src}_boot.S && " +
         "ld -m elf_i386 -Ttext 0x7c00 -e _start --oformat binary " +
         "-o '$wslDir/${name}_boot.bin' '$wslDir/${name}_boot.o'")
     if ($LASTEXITCODE -ne 0) { throw "boot-sector build failed: $name" }
@@ -62,7 +76,7 @@ foreach ($f in $fixtures) {
     if (Test-Path -LiteralPath $debugLog) {
         Remove-Item -LiteralPath $debugLog -Force -Confirm:$false
     }
-    $cmdLine = "qemu-system-x86_64 -accel tcg,thread=single -machine pc " +
+    $cmdLine = "qemu-system-x86_64 $accel -machine pc " +
         "-m 64M -smp 2 -vga cirrus -nic none " +
         "-drive file=${name}_boot.bin,format=raw,if=floppy -boot a " +
         "-qmp tcp:127.0.0.1:$($f.Port),server=on,wait=off " +
