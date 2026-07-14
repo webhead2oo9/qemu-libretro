@@ -95,10 +95,10 @@ protected_mode:
 1:	mov al, 'B'
 	out dx, al
 
-	/* Probe must now read OWNED (tag 0x3D, ver 1, state 2, token 0). */
+	/* Probe must now read OWNED (tag 0x3D, ver 1, state 2, token 0):
+	 * the exact word, so a nonzero token or version drift also fails. */
 	mov eax, dword ptr [0xefffefb4]
-	shr eax, 16
-	cmp ax, 0x3d12
+	cmp eax, 0x3d120000
 	je 1f
 	mov al, 'o'
 	out dx, al
@@ -125,11 +125,11 @@ protected_mode:
 	out dx, al
 
 release:
-	/* Owner's level-0 wglDeleteContext releases the session to FREE. */
+	/* Owner's level-0 wglDeleteContext releases the session to FREE:
+	 * exact probe word again (tag 0x3D, ver 1, state 0, token 0). */
 	mov dword ptr [0xefffeff4], 0x5b5eb5e5
 	mov eax, dword ptr [0xefffefb4]
-	shr eax, 16
-	cmp ax, 0x3d10
+	cmp eax, 0x3d100000
 	je 1f
 	mov al, 'f'
 	out dx, al

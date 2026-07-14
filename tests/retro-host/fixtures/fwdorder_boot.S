@@ -17,9 +17,10 @@
  *   R  live second process refused          (x = misgranted, halt)
  *   D  successor granted after crash expiry (d = refused, halt)
  *   1  shared refcount repaired to 1        (2 = repair lost)
+ *   W  claim word warped to successor VA    (w = warp lost, halt)
  *   T  teardown poked
  *
- *   expected (before and after the reverse-order fix):  LBRD1T
+ *   expected (before and after the reverse-order fix):  LBRD1WT
  *
  * Build: as --32 -o x.o fwdorder_boot.S
  *        ld -m elf_i386 -Ttext 0x7c00 -e _start --oformat binary -o x.bin x.o
@@ -108,8 +109,11 @@ wait_tick:
 	dec bl
 	jnz wait_tick
 
-	/* Successor SetPixelFormat: legacy crash release must free the
-	 * session, grant this request, and repair the shared refcount. */
+	/* Successor SetPixelFormat from a DIFFERENT normalized VA (the
+	 * value measured on real XP): legacy crash release must free the
+	 * session, grant this request, warp the ring claim to the new VA,
+	 * and repair the shared refcount. */
+	mov dword ptr [0xefffb004], 0x0097e000
 	call set_pixel_format
 	cmp eax, 0x5b5eb5e5
 	je 1f
@@ -123,6 +127,16 @@ wait_tick:
 	mov eax, dword ptr [0xec300004]
 	and al, 0x0f
 	add al, '0'
+	out dx, al
+
+	/* Claim word must point at the successor VA, low bits preserved. */
+	mov eax, dword ptr [0xec000004]
+	cmp eax, 0x0097efc0
+	je 1f
+	mov al, 'w'
+	out dx, al
+	jmp hang
+1:	mov al, 'W'
 	out dx, al
 
 	/* Clean release + DLL-unload teardown. */

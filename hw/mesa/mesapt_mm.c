@@ -116,6 +116,11 @@ typedef struct MesaPTState
     int64_t owner_heartbeat_expiry;
     bool owner_heartbeat_enabled;
     bool owner_tokened;
+    /* A crash-expired legacy owner was released but its ring claim may
+     * still be counted; the next successful FREE-state grant may repair
+     * the shared refcount by one. Survives a successor SetPixelFormat
+     * that fails between the release and a later retry. */
+    bool legacy_repair_pending;
 
     struct MesaPTReply {
         uint32_t mesa_ver;
@@ -239,6 +244,8 @@ static void mesapt_ring_reset(MesaPTState *s)
     fifoptr[1] = 0;
     dataptr[0] = ALIGNED(1) >> 2;
     dataptr[1] = 0;
+    /* The zeroed refcount no longer carries any dead claimant. */
+    s->legacy_repair_pending = false;
 }
 
 static void mesapt_session_reclaim(MesaPTState *s, const char *reason)
@@ -2897,7 +2904,6 @@ static void mesapt_write_main(void *opaque)
                     bool was_free;
                     bool tokened_grant;
                     bool grant;
-                    bool legacy_crash_released = false;
 
                     if (mesapt_legacy_owner_expired(s, curr_ts)) {
                         DPRINTF("session %" PRIu64
@@ -2907,7 +2913,7 @@ static void mesapt_write_main(void *opaque)
                         /* Preserve the initialized legacy Mesa/window state so
                          * the historical warp path below can rebind its ring. */
                         mesapt_session_release(s, "legacy crash timeout");
-                        legacy_crash_released = true;
+                        s->legacy_repair_pending = true;
                     }
                     mesapt_session_expire(s, reservation_now);
                     was_free = s->session_state == MESA_SESSION_FREE;
@@ -2978,17 +2984,21 @@ static void mesapt_write_main(void *opaque)
                             fifoptr[1] = (fifoptr[1] & 0xFFFU) |
                                          normalized_ptm;
                         }
-                        /* Patch the shared refcount down only when this same
-                         * request just released a crash-expired legacy owner:
-                         * the surplus count then belongs to that dead
-                         * claimant. On any other FREE-state grant a count
-                         * above one is another LIVE process sharing this ring
-                         * (reverse launch order, same normalized ptm VA on
-                         * real XP), and decrementing it would disguise that
-                         * process as the owner at its own SetPixelFormat. */
-                        if (legacy_crash_released && dataptr[1] > 1) {
-                            DPRINTF("..reset refcnt %04x", dataptr[1]);
-                            dataptr[1]--;
+                        /* Patch the shared refcount down only when a
+                         * crash-expired legacy owner was released and not yet
+                         * repaired: the surplus count then belongs to that
+                         * dead claimant. On any other FREE-state grant a
+                         * count above one is another LIVE process sharing
+                         * this ring (reverse launch order, same normalized
+                         * ptm VA on real XP), and decrementing it would
+                         * disguise that process as the owner at its own
+                         * SetPixelFormat. */
+                        if (s->legacy_repair_pending) {
+                            if (dataptr[1] > 1) {
+                                DPRINTF("..reset refcnt %04x", dataptr[1]);
+                                dataptr[1]--;
+                            }
+                            s->legacy_repair_pending = false;
                         }
                     }
                     if (s->procRet == MESAGL_MAGIC) {
