@@ -2737,6 +2737,13 @@ static void mesapt_write_main(void *opaque)
                     dispTimerSched(s->dispTimer, &s->crashRC);
                 } while(0);
                 break;
+            case 0xFD4:
+                DPRINTF_COND((GLFuncTrace() == 2),
+                    ">>>>>>>> wglPublishBuffer <<<<<<<<");
+                s->perfs.stat();
+                MGLPublishBuffer();
+                dispTimerSched(s->dispTimer, &s->crashRC);
+                break;
             case 0xFEC:
 #define PPFD_CONFIG_DISPATCH() \
     int enable = (*(int *)ppfd) & 0x01U, \

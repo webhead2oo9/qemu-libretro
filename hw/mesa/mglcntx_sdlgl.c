@@ -466,10 +466,16 @@ int MGLMakeCurrent(uint32_t cntxRC, int level)
     return 0;
 }
 
-int MGLSwapBuffers(void)
+int MGLPublishBuffer(void)
 {
     MGLActivateHandler(1, 0);
     MesaBlitScale();
+    return 1;
+}
+
+int MGLSwapBuffers(void)
+{
+    MGLPublishBuffer();
     SDL_GL_SwapWindow(window);
     return 1;
 }

@@ -31,6 +31,7 @@ void MGLTmpContext(void);
 void MGLWndRelease(void);
 int MGLMakeCurrent(uint32_t, int);
 void MGLReleaseCurrent(void);
+int MGLPublishBuffer(void);
 int MGLSwapBuffers(void);
 int MGLChoosePixelFormat(void);
 int MGLDescribePixelFormat(int, unsigned int, void *);

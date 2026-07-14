@@ -456,10 +456,16 @@ void MGLReleaseCurrent(void)
     glXMakeContextCurrent(dpy, None, None, NULL);
 }
 
-int MGLSwapBuffers(void)
+int MGLPublishBuffer(void)
 {
     MGLActivateHandler(1, 0);
     MesaBlitScale();
+    return 1;
+}
+
+int MGLSwapBuffers(void)
+{
+    MGLPublishBuffer();
     glXSwapBuffers(dpy, win);
     return 1;
 }

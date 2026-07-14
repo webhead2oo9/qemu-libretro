@@ -374,7 +374,7 @@ void MGLReleaseCurrent(void)
     wglFuncs.MakeCurrent(NULL, NULL);
 }
 
-int MGLSwapBuffers(void)
+int MGLPublishBuffer(void)
 {
     MGLActivateHandler(1, 0);
     /* qemu-libretro: read the finished frame back. When the guest asked
@@ -384,6 +384,12 @@ int MGLSwapBuffers(void)
      * without a second flip. */
     int scaled = MesaBlitScale();
     mesa_swap_notify(ScalerBlitFlip() && !scaled);
+    return 1;
+}
+
+int MGLSwapBuffers(void)
+{
+    MGLPublishBuffer();
     return SwapBuffers(hDC);
 }
 
