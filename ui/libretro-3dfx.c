@@ -95,6 +95,8 @@ static struct {
     int64_t frontend_last_seen_us;
     bool frontend_idle;
     bool geometry_error_reported;
+    bool force_sync_readback;   /* deterministic acceptance capture; normal
+                                 * rendering keeps the asynchronous PBO path */
     bool pbo_broken;            /* no PBO support, or it errored: stay
                                  * on the synchronous path for good */
     void (WINAPI *glReadPixels)(int, int, int, int, unsigned, unsigned,
@@ -152,8 +154,12 @@ void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque)
 
 void qemu_fx_register_sink(const QemuFxSink *sink)
 {
+    const char *force_sync = g_getenv("QEMU_FX_FORCE_SYNC_READBACK");
+
     fx.sink = sink;
     fx.geometry_error_reported = false;
+    fx.force_sync_readback = force_sync && force_sync[0] &&
+                             strcmp(force_sync, "0");
     if (!fx.dispatch_initialized) {
         qemu_thread_get_self(&fx.dispatch_thread);
         qemu_cond_init(&fx.dispatch_cond);
@@ -625,7 +631,7 @@ static void fx_swap_readback(bool top_down)
      * geometry change — the frontend re-inits its video driver to
      * black on those and needs a real frame at the new size. */
     bool resized = fx.width != fx.pub_width || fx.height != fx.pub_height;
-    bool force_sync = resized || resumed;
+    bool force_sync = fx.force_sync_readback || resized || resumed;
     if (!force_sync && now - fx.last_capture_us < FX_CAPTURE_MIN_US) {
         return;
     }
