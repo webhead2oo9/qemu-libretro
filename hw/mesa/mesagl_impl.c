@@ -1664,6 +1664,23 @@ void doMesaFunc(int FEnum, uint32_t *arg, uintptr_t *parg, uintptr_t *ret)
                         fprintf(stderr, "%08x ", arg[i]);
                     if (nargs)
                         fprintf(stderr, "\n");
+                    if (FEnum == FEnum_glProgramStringARB) {
+                        MESA_PFN(PFNGLGETINTEGERVPROC, glGetIntegerv);
+                        MESA_PFN(PFNGLGETSTRINGPROC, glGetString);
+                        GLint error_position = -1;
+                        const GLubyte *error_string;
+
+                        PFN_CALL(glGetIntegerv(
+                            GL_PROGRAM_ERROR_POSITION_ARB,
+                            &error_position));
+                        error_string = PFN_CALL(glGetString(
+                            GL_PROGRAM_ERROR_STRING_ARB));
+                        fprintf(stderr,
+                                "mgl_error: program position %d: %s\n",
+                                error_position,
+                                error_string ? (const char *)error_string :
+                                               "<no error string>");
+                    }
                 }
             }
             break;
