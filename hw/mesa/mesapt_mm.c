@@ -26,6 +26,7 @@
 #include "ui/console.h"
 
 #include "mesagl_impl.h"
+#include "mesapt_interleaved.h"
 
 #define DEBUG_MESAPT
 
@@ -116,6 +117,7 @@ typedef struct MesaPTState
     int64_t owner_heartbeat_expiry;
     bool owner_heartbeat_enabled;
     bool owner_tokened;
+    bool qxpd3d_interleaved;
     /* A crash-expired legacy owner was released but its ring claim may
      * still be counted; the next successful FREE-state grant may repair
      * the shared refcount by one. Survives a successor SetPixelFormat
@@ -209,8 +211,12 @@ static const uint8_t qxpicd_signature[8] = {
     'Q', 'X', 'P', 'I', 'C', 'D', 0, MESA_PROBE_VER
 };
 
-static const uint8_t qxpd3d_signature[8] = {
+static const uint8_t qxpd3d_signature_v1[8] = {
     'Q', 'X', 'P', 'D', '3', 'D', 0, MESA_PROBE_VER
+};
+
+static const uint8_t qxpd3d_signature_v2[8] = {
+    'Q', 'X', 'P', 'D', '3', 'D', 0, 2
 };
 
 static struct MesaPTReply *mesapt_reply_for_cpu(MesaPTState *s)
@@ -303,6 +309,7 @@ static void mesapt_session_release(MesaPTState *s, const char *reason)
     s->owner_heartbeat_expiry = 0;
     s->owner_heartbeat_enabled = false;
     s->owner_tokened = false;
+    s->qxpd3d_interleaved = false;
     s->mglCntxAtt = 0;
     mesa_set_session_owned(false);
 }
@@ -321,12 +328,14 @@ static uint32_t mesapt_probe_value(MesaPTState *s)
            ((uint32_t)s->session_state << 16) | token;
 }
 
-static void vtxarry_init(vtxarry_t *varry, int size, int type, int stride, void *ptr)
+static void vtxarry_init(vtxarry_t *varry, int size, int type, int stride,
+                         void *ptr, uint32_t handle)
 {
     varry->size = size;
     varry->type = type;
     varry->stride = stride;
     varry->ptr = ptr;
+    varry->handle = handle;
 }
 
 static void vtxarry_ptr_reset(MesaPTState *s)
@@ -430,7 +439,8 @@ static vtxarry_t *vattr2arry(MesaPTState *s, int attr)
     return arry;
 }
 
-static void PushVertexArray(MesaPTState *s, const void *pshm, int start, int end)
+static bool PushVertexArray(MesaPTState *s, const void *pshm,
+                            int start, int end)
 {
     uint8_t *varry_ptr = (uint8_t *)pshm;
     int i, cbElem, n, ovfl;
@@ -447,6 +457,53 @@ static void PushVertexArray(MesaPTState *s, const void *pshm, int start, int end
         s->Interleaved.enable = 0;
     }
     else {
+        if (s->qxpd3d_interleaved) {
+            MesaptInterleavedArray arrays[18];
+            MesaptInterleavedLayout layout;
+            vtxarry_t *sources[18];
+            int source_count = 0;
+            int interleaved;
+
+            sources[source_count++] = &s->Color;
+            sources[source_count++] = &s->EdgeFlag;
+            sources[source_count++] = &s->Index;
+            sources[source_count++] = &s->Normal;
+            for (i = 0; i < MAX_TEXUNIT; ++i) {
+                sources[source_count++] = &s->TexCoord[i];
+            }
+            sources[source_count++] = &s->Vertex;
+            sources[source_count++] = &s->SecondaryColor;
+            sources[source_count++] = &s->FogCoord;
+            sources[source_count++] = &s->Weight;
+            sources[source_count++] = &s->GenAttrib[0];
+            sources[source_count++] = &s->GenAttrib[1];
+            for (i = 0; i < source_count; ++i) {
+                arrays[i].enabled = sources[i]->enable && sources[i]->ptr;
+                arrays[i].handle = sources[i]->handle;
+                arrays[i].stride = sources[i]->stride;
+                arrays[i].element_bytes =
+                    szgldata(sources[i]->size, sources[i]->type);
+            }
+            interleaved = mesapt_interleaved_layout(
+                arrays, source_count, start, end, s->szVertCache, &layout);
+            if (interleaved) {
+                if (interleaved > 0) {
+                    uint8_t *destination = LookupVertex(
+                        MESAPT_D3D_INTERLEAVED_BASE, s->szVertCache);
+
+                    if (!destination) {
+                        return false;
+                    }
+                    memcpy(destination + layout.destination_offset,
+                           varry_ptr, layout.copy_bytes);
+                    s->datacb += (int)layout.consumed_bytes;
+                } else {
+                    DPRINTF(" *WARN* Invalid QXPD3D interleaved array layout");
+                    return false;
+                }
+                return true;
+            }
+        }
         if (s->Color.enable && s->Color.ptr) {
             cbElem = (s->Color.stride)? s->Color.stride:szgldata(s->Color.size,s->Color.type);
             n = cbElem*(end - start) + szgldata(s->Color.size,s->Color.type);
@@ -562,6 +619,7 @@ static void PushVertexArray(MesaPTState *s, const void *pshm, int start, int end
             }
         }
     }
+    return true;
 }
 static void InitClientStates(MesaPTState *s)
 {
@@ -811,7 +869,9 @@ static void processArgs(MesaPTState *s)
         case FEnum_glArrayElement:
         case FEnum_glArrayElementEXT:
             s->elemMax = (s->arg[0] > s->elemMax)? s->arg[0]:s->elemMax;
-            PushVertexArray(s, s->hshm, s->arg[0], s->arg[0]);
+            if (!PushVertexArray(s, s->hshm, s->arg[0], s->arg[0])) {
+                s->arg[0] = 0;
+            }
             break;
         case FEnum_glBindImageTextures:
         case FEnum_glBindSamplers:
@@ -849,7 +909,9 @@ static void processArgs(MesaPTState *s)
         case FEnum_glColorPointerEXT:
             vtxarry_init(&s->Color, s->arg[0], s->arg[1], s->arg[2], (s->arrayBuf == 0)?
                 LookupVertex((s->FEnum == FEnum_glColorPointer)? s->arg[3]:s->arg[4], s->szVertCache):
-                (void *)(uintptr_t)((s->FEnum == FEnum_glColorPointer)? s->arg[3]:s->arg[4]));
+                (void *)(uintptr_t)((s->FEnum == FEnum_glColorPointer)? s->arg[3]:s->arg[4]),
+                (s->arrayBuf == 0)?
+                    ((s->FEnum == FEnum_glColorPointer)? s->arg[3]:s->arg[4]):0);
             s->parg[3] = VAL(s->Color.ptr);
             s->parg[0] = VAL(s->Color.ptr);
             break;
@@ -857,7 +919,9 @@ static void processArgs(MesaPTState *s)
         case FEnum_glEdgeFlagPointerEXT:
             vtxarry_init(&s->EdgeFlag, 1, GL_BYTE, s->arg[0], (s->arrayBuf == 0)?
                 LookupVertex((s->FEnum == FEnum_glEdgeFlagPointer)? s->arg[1]:s->arg[2], s->szVertCache):
-                (void *)(uintptr_t)((s->FEnum == FEnum_glEdgeFlagPointer)? s->arg[1]:s->arg[2]));
+                (void *)(uintptr_t)((s->FEnum == FEnum_glEdgeFlagPointer)? s->arg[1]:s->arg[2]),
+                (s->arrayBuf == 0)?
+                    ((s->FEnum == FEnum_glEdgeFlagPointer)? s->arg[1]:s->arg[2]):0);
             s->parg[1] = VAL(s->EdgeFlag.ptr);
             s->parg[2] = VAL(s->EdgeFlag.ptr);
             break;
@@ -865,7 +929,9 @@ static void processArgs(MesaPTState *s)
         case FEnum_glIndexPointerEXT:
             vtxarry_init(&s->Index, 1, s->arg[0], s->arg[1], (s->arrayBuf == 0)?
                 LookupVertex((s->FEnum == FEnum_glIndexPointer)? s->arg[2]:s->arg[3], s->szVertCache):
-                (void *)(uintptr_t)((s->FEnum == FEnum_glIndexPointer)? s->arg[2]:s->arg[3]));
+                (void *)(uintptr_t)((s->FEnum == FEnum_glIndexPointer)? s->arg[2]:s->arg[3]),
+                (s->arrayBuf == 0)?
+                    ((s->FEnum == FEnum_glIndexPointer)? s->arg[2]:s->arg[3]):0);
             s->parg[2] = VAL(s->Index.ptr);
             s->parg[3] = VAL(s->Index.ptr);
             break;
@@ -873,7 +939,9 @@ static void processArgs(MesaPTState *s)
         case FEnum_glNormalPointerEXT:
             vtxarry_init(&s->Normal, 3, s->arg[0], s->arg[1], (s->arrayBuf == 0)?
                 LookupVertex((s->FEnum == FEnum_glNormalPointer)? s->arg[2]:s->arg[3], s->szVertCache):
-                (void *)(uintptr_t)((s->FEnum == FEnum_glNormalPointer)? s->arg[2]:s->arg[3]));
+                (void *)(uintptr_t)((s->FEnum == FEnum_glNormalPointer)? s->arg[2]:s->arg[3]),
+                (s->arrayBuf == 0)?
+                    ((s->FEnum == FEnum_glNormalPointer)? s->arg[2]:s->arg[3]):0);
             s->parg[2] = VAL(s->Normal.ptr);
             s->parg[3] = VAL(s->Normal.ptr);
             break;
@@ -881,7 +949,9 @@ static void processArgs(MesaPTState *s)
         case FEnum_glTexCoordPointerEXT:
             vtxarry_init(&s->TexCoord[s->texUnit], s->arg[0], s->arg[1], s->arg[2], (s->arrayBuf == 0)?
                 LookupVertex((s->FEnum == FEnum_glTexCoordPointer)? s->arg[3]:s->arg[4], s->szVertCache):
-                (void *)(uintptr_t)((s->FEnum == FEnum_glTexCoordPointer)? s->arg[3]:s->arg[4]));
+                (void *)(uintptr_t)((s->FEnum == FEnum_glTexCoordPointer)? s->arg[3]:s->arg[4]),
+                (s->arrayBuf == 0)?
+                    ((s->FEnum == FEnum_glTexCoordPointer)? s->arg[3]:s->arg[4]):0);
             s->parg[3] = VAL(s->TexCoord[s->texUnit].ptr);
             s->parg[0] = VAL(s->TexCoord[s->texUnit].ptr);
             break;
@@ -889,26 +959,31 @@ static void processArgs(MesaPTState *s)
         case FEnum_glVertexPointerEXT:
             vtxarry_init(&s->Vertex, s->arg[0], s->arg[1], s->arg[2], (s->arrayBuf == 0)?
                 LookupVertex((s->FEnum == FEnum_glVertexPointer)? s->arg[3]:s->arg[4], s->szVertCache):
-                (void *)(uintptr_t)((s->FEnum == FEnum_glVertexPointer)? s->arg[3]:s->arg[4]));
+                (void *)(uintptr_t)((s->FEnum == FEnum_glVertexPointer)? s->arg[3]:s->arg[4]),
+                (s->arrayBuf == 0)?
+                    ((s->FEnum == FEnum_glVertexPointer)? s->arg[3]:s->arg[4]):0);
             s->parg[3] = VAL(s->Vertex.ptr);
             s->parg[0] = VAL(s->Vertex.ptr);
             break;
         case FEnum_glSecondaryColorPointer:
         case FEnum_glSecondaryColorPointerEXT:
             vtxarry_init(&s->SecondaryColor, s->arg[0], s->arg[1], s->arg[2], (s->arrayBuf == 0)?
-                LookupVertex(s->arg[3], s->szVertCache):(void *)(uintptr_t)s->arg[3]);
+                LookupVertex(s->arg[3], s->szVertCache):(void *)(uintptr_t)s->arg[3],
+                (s->arrayBuf == 0)?s->arg[3]:0);
             s->parg[3] = VAL(s->SecondaryColor.ptr);
             break;
         case FEnum_glFogCoordPointer:
         case FEnum_glFogCoordPointerEXT:
             vtxarry_init(&s->FogCoord, 1, s->arg[0], s->arg[1], (s->arrayBuf == 0)?
-                LookupVertex(s->arg[2], s->szVertCache):(void *)(uintptr_t)s->arg[2]);
+                LookupVertex(s->arg[2], s->szVertCache):(void *)(uintptr_t)s->arg[2],
+                (s->arrayBuf == 0)?s->arg[2]:0);
             s->parg[2] = VAL(s->FogCoord.ptr);
             break;
         case FEnum_glVertexWeightPointerEXT:
         case FEnum_glWeightPointerARB:
             vtxarry_init(&s->Weight, s->arg[0], s->arg[1], s->arg[2], (s->arrayBuf == 0)?
-                LookupVertex(s->arg[3], s->szVertCache):(void *)(uintptr_t)s->arg[3]);
+                LookupVertex(s->arg[3], s->szVertCache):(void *)(uintptr_t)s->arg[3],
+                (s->arrayBuf == 0)?s->arg[3]:0);
             s->parg[3] = VAL(s->Weight.ptr);
             break;
         case FEnum_glVertexAttribIPointer:
@@ -919,7 +994,8 @@ static void processArgs(MesaPTState *s)
             {
                 vtxarry_t *arry = vattr2arry(s, s->arg[0]);
                 vtxarry_init(arry, s->arg[1], s->arg[2], s->arg[3], (s->arrayBuf == 0)?
-                        LookupVertex(s->arg[4], s->szVertCache):(void *)(uintptr_t)s->arg[4]);
+                        LookupVertex(s->arg[4], s->szVertCache):(void *)(uintptr_t)s->arg[4],
+                        (s->arrayBuf == 0)?s->arg[4]:0);
                 s->parg[0] = VAL(arry->ptr);
             }
             break;
@@ -928,12 +1004,15 @@ static void processArgs(MesaPTState *s)
             {
                 vtxarry_t *arry = vattr2arry(s, s->arg[0]);
                 vtxarry_init(arry, s->arg[1], s->arg[2], s->arg[4], (s->arrayBuf == 0)?
-                        LookupVertex(s->arg[5], s->szVertCache):(void *)(uintptr_t)s->arg[5]);
+                        LookupVertex(s->arg[5], s->szVertCache):(void *)(uintptr_t)s->arg[5],
+                        (s->arrayBuf == 0)?s->arg[5]:0);
                 s->parg[1] = VAL(arry->ptr);
             }
             break;
         case FEnum_glInterleavedArrays:
-            vtxarry_init(&s->Interleaved, szgldata(s->arg[0], 0), 0, s->arg[1], LookupVertex(s->arg[2], s->szVertCache));
+            vtxarry_init(&s->Interleaved, szgldata(s->arg[0], 0), 0,
+                         s->arg[1], LookupVertex(s->arg[2], s->szVertCache),
+                         s->arg[2]);
             s->Interleaved.enable = 1;
             s->parg[2] = VAL(s->Interleaved.ptr);
             break;
@@ -1182,7 +1261,10 @@ static void processArgs(MesaPTState *s)
         case FEnum_glDrawArraysEXT:
             if (s->arg[2] && (s->arrayBuf == 0)) {
                 s->elemMax = ((s->arg[1] + s->arg[2] - 1) > s->elemMax)? (s->arg[1] + s->arg[2] - 1):s->elemMax;
-                PushVertexArray(s, s->hshm, s->arg[1], s->arg[1] + s->arg[2] - 1);
+                if (!PushVertexArray(s, s->hshm, s->arg[1],
+                                     s->arg[1] + s->arg[2] - 1)) {
+                    s->arg[2] = 0;
+                }
             }
             break;
         case FEnum_glDrawArraysIndirect:
@@ -1232,7 +1314,10 @@ static void processArgs(MesaPTState *s)
                 //DPRINTF("DrawElements() %04x %04x", start, end);
                 s->elemMax = (end > s->elemMax)? end:s->elemMax;
                 if (s->arrayBuf == 0)
-                    PushVertexArray(s, PTR(s->hshm, s->datacb), start, end);
+                    if (!PushVertexArray(
+                            s, PTR(s->hshm, s->datacb), start, end)) {
+                        s->arg[1] = 0;
+                    }
             }
             break;
         case FEnum_glDrawElementsBaseVertex:
@@ -1275,7 +1360,11 @@ static void processArgs(MesaPTState *s)
                 base = (s->FEnum == FEnum_glDrawElementsBaseVertex)? s->arg[4]:s->arg[5];
                 s->elemMax = ((end + base) > s->elemMax)? (end + base):s->elemMax;
                 if (s->arrayBuf == 0)
-                    PushVertexArray(s, PTR(s->hshm, s->datacb), (start + base), (end + base));
+                    if (!PushVertexArray(
+                            s, PTR(s->hshm, s->datacb),
+                            start + base, end + base)) {
+                        s->arg[1] = 0;
+                    }
             }
             break;
         case FEnum_glDrawPixels:
@@ -1303,7 +1392,11 @@ static void processArgs(MesaPTState *s)
                 s->parg[1] = VAL(s->hshm);
                 s->elemMax = (s->arg[2] > s->elemMax)? s->arg[2]:s->elemMax;
                 if (s->arrayBuf == 0)
-                    PushVertexArray(s, PTR(s->hshm, s->datacb), s->arg[1], s->arg[2]);
+                    if (!PushVertexArray(
+                            s, PTR(s->hshm, s->datacb),
+                            s->arg[1], s->arg[2])) {
+                        s->arg[3] = 0;
+                    }
             }
             break;
         case FEnum_glDrawRangeElementsBaseVertex:
@@ -1314,7 +1407,11 @@ static void processArgs(MesaPTState *s)
                 int base = s->arg[6];
                 s->elemMax = ((s->arg[2] + base)> s->elemMax)? (s->arg[2] + base):s->elemMax;
                 if (s->arrayBuf == 0)
-                    PushVertexArray(s, PTR(s->hshm, s->datacb), (s->arg[1] + base), (s->arg[2] + base));
+                    if (!PushVertexArray(
+                            s, PTR(s->hshm, s->datacb),
+                            s->arg[1] + base, s->arg[2] + base)) {
+                        s->arg[3] = 0;
+                    }
             }
             break;
         case FEnum_glGetInternalformativ:
@@ -1499,7 +1596,11 @@ static void processArgs(MesaPTState *s)
         case FEnum_glLockArraysEXT:
             //DPRINTF("LockArraysEXT() %04x %04x", s->arg[0], s->arg[1]);
             if (s->arg[1])
-                PushVertexArray(s, s->hshm, s->arg[0], s->arg[0] + s->arg[1] - 1);
+                if (!PushVertexArray(
+                        s, s->hshm, s->arg[0],
+                        s->arg[0] + s->arg[1] - 1)) {
+                    s->arg[1] = 0;
+                }
             break;
         case FEnum_glProgramNamedParameter4dvNV:
         case FEnum_glProgramNamedParameter4fvNV:
@@ -2650,6 +2751,7 @@ static void mesapt_write_main(void *opaque)
     else if (addr == 0xFBC) {
         switch (val) {
             case 0xA0320:
+                s->qxpd3d_interleaved = false;
                 if (mesapt_legacy_owner_expired(s,
                         qemu_clock_get_ms(QEMU_CLOCK_REALTIME))) {
                     DPRINTF("session %" PRIu64
@@ -2673,9 +2775,16 @@ static void mesapt_write_main(void *opaque)
                             qxpicd_signature,
                             sizeof(qxpicd_signature)) == 0 ||
                      memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
-                            qxpd3d_signature,
-                            sizeof(qxpd3d_signature)) == 0) &&
+                             qxpd3d_signature_v1,
+                             sizeof(qxpd3d_signature_v1)) == 0 ||
+                     memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
+                             qxpd3d_signature_v2,
+                             sizeof(qxpd3d_signature_v2)) == 0) &&
                     (InitMesaGL() == 0)) {
+                    s->qxpd3d_interleaved =
+                        memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
+                               qxpd3d_signature_v2,
+                               sizeof(qxpd3d_signature_v2)) == 0;
                     s->MesaVer = (uint32_t)((val >> 12) & 0xFFU) | ((val & 0xFFFU) << 8);
                     s->mglCntxAtt = 0;
                     MGLTmpContext();

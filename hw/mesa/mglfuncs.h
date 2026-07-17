@@ -11,6 +11,7 @@ typedef struct {
     int type;
     int stride;
     void *ptr;
+    unsigned int handle;
 } vtxarry_t;
 
 #define PAGE_SIZE       0x1000
