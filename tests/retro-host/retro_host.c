@@ -8,6 +8,7 @@
  *          [--opt key=value]... [--flip key=value]...
  *          [--disk-swap N | --disk-append PATH | --disk-remove N]...
  *          [--disk-swap-unload N]
+ *          [--frame-profile START_EVENT STOP_EVENT]
  *   --opt  seeds a core-option value served via GET_VARIABLE
  *   --flip changes one mid-run (after baseline) and raises
  *          GET_VARIABLE_UPDATE; flips apply in order, ~1.5s apart
@@ -46,6 +47,23 @@ static bool g_instant_close;
 static bool g_events_close;
 static int g_qmp_cycles = 1;
 static volatile long g_frames;
+
+#define MAX_FRAME_PROFILE_INTERVALS 65536
+static bool g_frame_profile_enabled;
+static bool g_frame_profile_started;
+static bool g_frame_profile_stopped;
+static HANDLE g_frame_profile_start_event;
+static HANDLE g_frame_profile_stop_event;
+static LARGE_INTEGER g_frame_profile_frequency;
+static LARGE_INTEGER g_frame_profile_start;
+static LARGE_INTEGER g_frame_profile_stop;
+static LARGE_INTEGER g_frame_profile_last_fresh;
+static unsigned long g_frame_profile_callbacks;
+static unsigned long g_frame_profile_fresh;
+static unsigned long g_frame_profile_duped;
+static unsigned long g_frame_profile_interval_overflow;
+static LONGLONG g_frame_profile_intervals[MAX_FRAME_PROFILE_INTERVALS];
+static size_t g_frame_profile_interval_count;
 
 /* core options served via GET_VARIABLE */
 #define MAX_OPTS 32
@@ -191,6 +209,58 @@ static unsigned long g_dump_callback;
 static unsigned long g_dump_sequence;
 static struct { unsigned w, h; int count; } g_dump_st;
 
+static void frame_profile_callback(const void *data)
+{
+    LARGE_INTEGER now;
+
+    if (!g_frame_profile_enabled) {
+        return;
+    }
+    QueryPerformanceCounter(&now);
+    if (WaitForSingleObject(g_frame_profile_start_event, 0) ==
+        WAIT_OBJECT_0) {
+        g_frame_profile_started = true;
+        g_frame_profile_stopped = false;
+        g_frame_profile_start = now;
+        g_frame_profile_stop.QuadPart = 0;
+        g_frame_profile_last_fresh.QuadPart = 0;
+        g_frame_profile_callbacks = 0;
+        g_frame_profile_fresh = 0;
+        g_frame_profile_duped = 0;
+        g_frame_profile_interval_count = 0;
+        g_frame_profile_interval_overflow = 0;
+    }
+    if (!g_frame_profile_started || g_frame_profile_stopped) {
+        return;
+    }
+    if (WaitForSingleObject(g_frame_profile_stop_event, 0) ==
+        WAIT_OBJECT_0) {
+        g_frame_profile_stopped = true;
+        g_frame_profile_stop = now;
+        return;
+    }
+
+    g_frame_profile_callbacks++;
+    if (!data) {
+        g_frame_profile_duped++;
+        return;
+    }
+
+    g_frame_profile_fresh++;
+    if (g_frame_profile_last_fresh.QuadPart) {
+        LONGLONG interval =
+            now.QuadPart - g_frame_profile_last_fresh.QuadPart;
+        if (g_frame_profile_interval_count <
+            MAX_FRAME_PROFILE_INTERVALS) {
+            g_frame_profile_intervals[g_frame_profile_interval_count++] =
+                interval;
+        } else {
+            g_frame_profile_interval_overflow++;
+        }
+    }
+    g_frame_profile_last_fresh = now;
+}
+
 static void dump_bmp(const void *data, unsigned w, unsigned h, size_t pitch,
                      unsigned long sequence)
 {
@@ -227,6 +297,7 @@ static void dump_bmp(const void *data, unsigned w, unsigned h, size_t pitch,
 static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
 {
     InterlockedIncrement(&g_frames);
+    frame_profile_callback(data);
     if (!g_dump || !data) {
         return;
     }
@@ -247,6 +318,87 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
     if (++g_dump_st.count % 300 == 30) {
         dump_bmp(data, w, h, pitch, 0);
     }
+}
+
+static int compare_frame_intervals(const void *left, const void *right)
+{
+    LONGLONG a = *(const LONGLONG *)left;
+    LONGLONG b = *(const LONGLONG *)right;
+    return (a > b) - (a < b);
+}
+
+static unsigned long long frame_profile_microseconds(LONGLONG ticks)
+{
+    return (unsigned long long)(ticks * 1000000ULL /
+                                g_frame_profile_frequency.QuadPart);
+}
+
+static unsigned long long frame_profile_percentile(unsigned percentile)
+{
+    if (!g_frame_profile_interval_count) {
+        return 0;
+    }
+    size_t index =
+        (g_frame_profile_interval_count * percentile + 99) / 100 - 1;
+    return frame_profile_microseconds(g_frame_profile_intervals[index]);
+}
+
+static void frame_profile_report(void)
+{
+    unsigned long stalls_50ms = 0;
+    unsigned long stalls_100ms = 0;
+    unsigned long stalls_250ms = 0;
+    unsigned long stalls_1000ms = 0;
+    unsigned long long duration_us;
+    unsigned long long fresh_fps_milli;
+    unsigned long long callback_fps_milli;
+
+    if (!g_frame_profile_enabled) {
+        return;
+    }
+    if (g_frame_profile_started && !g_frame_profile_stopped) {
+        QueryPerformanceCounter(&g_frame_profile_stop);
+        g_frame_profile_stopped = true;
+    }
+    if (!g_frame_profile_started ||
+        g_frame_profile_stop.QuadPart <= g_frame_profile_start.QuadPart) {
+        fprintf(stderr, "FrameProfile unavailable started=%d stopped=%d\n",
+                g_frame_profile_started, g_frame_profile_stopped);
+        return;
+    }
+
+    qsort(g_frame_profile_intervals, g_frame_profile_interval_count,
+          sizeof(g_frame_profile_intervals[0]), compare_frame_intervals);
+    for (size_t i = 0; i < g_frame_profile_interval_count; i++) {
+        unsigned long long interval_us =
+            frame_profile_microseconds(g_frame_profile_intervals[i]);
+        if (interval_us >= 50000) stalls_50ms++;
+        if (interval_us >= 100000) stalls_100ms++;
+        if (interval_us >= 250000) stalls_250ms++;
+        if (interval_us >= 1000000) stalls_1000ms++;
+    }
+
+    duration_us = frame_profile_microseconds(
+        g_frame_profile_stop.QuadPart - g_frame_profile_start.QuadPart);
+    fresh_fps_milli = duration_us ?
+        (unsigned long long)g_frame_profile_fresh * 1000000000ULL /
+            duration_us : 0;
+    callback_fps_milli = duration_us ?
+        (unsigned long long)g_frame_profile_callbacks * 1000000000ULL /
+            duration_us : 0;
+    fprintf(stderr,
+            "FrameProfile durationUs=%llu callbacks=%lu fresh=%lu "
+            "duped=%lu freshFpsMilli=%llu callbackFpsMilli=%llu "
+            "intervals=%llu overflow=%lu p50Us=%llu p95Us=%llu "
+            "p99Us=%llu maxUs=%llu stalls50ms=%lu stalls100ms=%lu "
+            "stalls250ms=%lu stalls1000ms=%lu\n",
+            duration_us, g_frame_profile_callbacks, g_frame_profile_fresh,
+            g_frame_profile_duped, fresh_fps_milli, callback_fps_milli,
+            (unsigned long long)g_frame_profile_interval_count,
+            g_frame_profile_interval_overflow,
+            frame_profile_percentile(50), frame_profile_percentile(95),
+            frame_profile_percentile(99), frame_profile_percentile(100),
+            stalls_50ms, stalls_100ms, stalls_250ms, stalls_1000ms);
 }
 
 static void audio_sample_cb(int16_t l, int16_t r) { (void)l; (void)r; }
@@ -650,6 +802,8 @@ int main(int argc, char **argv)
 {
     bool do_qmp = true, do_quit = true;
     const char *configured_system_dir;
+    const char *frame_profile_start_name = NULL;
+    const char *frame_profile_stop_name = NULL;
     WSADATA wsd;
 
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -671,7 +825,9 @@ int main(int argc, char **argv)
     if (argc < 4) {
         fprintf(stderr, "usage: %s <core.dll> <content> <qmp_port> "
                         "[--no-qmp] [--no-quit] [--opt k=v]... "
-                        "[--flip k=v]...\n", argv[0]);
+                        "[--flip k=v]... "
+                        "[--frame-profile START_EVENT STOP_EVENT]\n",
+                        argv[0]);
         return 2;
     }
     for (int i = 4; i < argc; i++) {
@@ -686,6 +842,10 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--joycpl"))  g_joycpl = true;
         if (!strcmp(argv[i], "--wait") && i + 1 < argc) {
             g_boot_wait = atoi(argv[++i]);
+        }
+        if (!strcmp(argv[i], "--frame-profile") && i + 2 < argc) {
+            frame_profile_start_name = argv[++i];
+            frame_profile_stop_name = argv[++i];
         }
         if (!strcmp(argv[i], "--opt") && i + 1 < argc) {
             if (!set_opt(argv[++i])) {
@@ -730,6 +890,20 @@ int main(int argc, char **argv)
             strcpy(g_flips[g_nflips].val, eq + 1);
             g_nflips++;
         }
+    }
+
+    if (frame_profile_start_name) {
+        g_frame_profile_start_event = OpenEventA(
+            SYNCHRONIZE, FALSE, frame_profile_start_name);
+        g_frame_profile_stop_event = OpenEventA(
+            SYNCHRONIZE, FALSE, frame_profile_stop_name);
+        if (!g_frame_profile_start_event || !g_frame_profile_stop_event ||
+            !QueryPerformanceFrequency(&g_frame_profile_frequency)) {
+            fprintf(stderr, "frame-profile event setup failed: %lu\n",
+                    GetLastError());
+            return 2;
+        }
+        g_frame_profile_enabled = true;
     }
     int port = atoi(argv[3]);
     WSAStartup(MAKEWORD(2, 2), &wsd);
@@ -866,6 +1040,13 @@ int main(int argc, char **argv)
 
     p_retro_unload_game();
     p_retro_deinit();
+    frame_profile_report();
+    if (g_frame_profile_start_event) {
+        CloseHandle(g_frame_profile_start_event);
+    }
+    if (g_frame_profile_stop_event) {
+        CloseHandle(g_frame_profile_stop_event);
+    }
 
     int total, in_mod;
     count_threads(dll, &total, &in_mod);
