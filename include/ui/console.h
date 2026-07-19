@@ -541,6 +541,7 @@ void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque);
  * that thread -- i.e. asynchronous draw submission can actually overlap. */
 bool qemu_fx_dispatch_ready(void);
 void qemu_fx_async_reserve(unsigned max_inflight);
+void qemu_fx_async_cancel(void);
 void qemu_fx_post_reserved(void (*fn)(void *opaque), void *opaque,
                            void (*free_opaque)(void *opaque));
 void qemu_fx_drain_async(void);

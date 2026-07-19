@@ -195,6 +195,22 @@ void qemu_fx_async_reserve(unsigned max_inflight)
     fx.async_inflight++;
 }
 
+void qemu_fx_async_cancel(void)
+{
+    /* Release a slot reserved by qemu_fx_async_reserve() when the caller decides
+     * not to post (e.g. the context was reclaimed while the reserve blocked, so
+     * the draw falls back to the synchronous path). */
+    if (!fx.dispatch_initialized ||
+        qemu_thread_is_self(&fx.dispatch_thread)) {
+        return;
+    }
+    g_assert(bql_locked());
+    if (fx.async_inflight > 0) {
+        fx.async_inflight--;
+        qemu_cond_broadcast(&fx.dispatch_cond);
+    }
+}
+
 void qemu_fx_post_reserved(void (*fn)(void *opaque), void *opaque,
                            void (*free_opaque)(void *opaque))
 {

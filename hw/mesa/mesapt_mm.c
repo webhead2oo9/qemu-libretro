@@ -54,6 +54,13 @@
  * one retained one-deep for client-array-pointer lifetime. */
 #define MESAPT_ASYNC_DRAW_DOORBELL 0xFB8
 #define MESAPT_ASYNC_MAX_INFLIGHT  2
+/* Over-read headroom so a malformed trailing FEnum in an exact-sized snapshot
+ * lands in zeroed slack rather than past the allocation. */
+#define MESAPT_ASYNC_CMD_SLACK     256u
+#define MESAPT_ASYNC_DATA_SLACK    0x8000u
+/* Batches whose snapshot would exceed this fall back to synchronous processing,
+ * bounding retained async memory (<= (MAX_INFLIGHT+1) * this). */
+#define MESAPT_ASYNC_MAX_SNAPSHOT_BYTES (16u * 1024u * 1024u)
 
 typedef struct MesaPTState MesaPTState;
 static void mesapt_drain_async(MesaPTState *s);
@@ -2575,7 +2582,8 @@ static void processFRet(MesaPTState *s)
 }
 
 static void processFifoRegions(MesaPTState *s, uint8_t *cmd_base,
-                               uint8_t *data_base, uint8_t *out_base)
+                               uint8_t *data_base, uint8_t *out_base,
+                               uint32_t cmd_cap, uint32_t data_cap)
 {
     uint32_t *fifoptr = (uint32_t *)cmd_base;
     uint32_t *dataptr = (uint32_t *)data_base;
@@ -2599,6 +2607,13 @@ static void processFifoRegions(MesaPTState *s, uint8_t *cmd_base,
             int numArgs, numData;
             s->FEnum = fifoptr[i++];
             numArgs = GLFEnumArgsCnt(s->FEnum);
+            /* Bound the command's argument read to the region. For the live
+             * mapping cmd_cap is MAX_FIFO (unchanged behavior); for an
+             * exact-sized async snapshot it stops a malformed trailing FEnum
+             * from over-reading past the allocation. */
+            if ((uint32_t)i + (uint32_t)numArgs > cmd_cap) {
+                break;
+            }
 #if DEBUG_FIFO
             if (i == (FIRST_FIFO + 1))
                 fprintf(stderr, "FIFO { [%02X] fifo %04x data %04x\n%02X ", FEnum, fifoptr[0], dataptr[0], s->FEnum);
@@ -2612,6 +2627,12 @@ static void processFifoRegions(MesaPTState *s, uint8_t *cmd_base,
             doMesaFunc(s->FEnum, s->arg, s->parg, &(s->FRet));
             processFRet(s);
             numData = (s->datacb & 0x03)? ((s->datacb >> 2) + 1):(s->datacb >> 2);
+            /* The current command's data read (bounded by its own reserve) lands
+             * in the snapshot's slack; stop before a further command runs off
+             * the data region. */
+            if ((uint32_t)j + (uint32_t)numData > data_cap) {
+                break;
+            }
             i += numArgs;
             j += numData;
         }
@@ -2647,7 +2668,8 @@ static void processFifo(MesaPTState *s)
 {
     processFifoRegions(s, s->fifo_ptr,
                        s->fifo_ptr + (MAX_FIFO << 2),
-                       s->fifo_ptr + (MGLSHM_SIZE - (3 * PAGE_SIZE)));
+                       s->fifo_ptr + (MGLSHM_SIZE - (3 * PAGE_SIZE)),
+                       MAX_FIFO, MAX_DATA);
 }
 
 static void ContextCreateCommon(MesaPTState *s)
@@ -2676,6 +2698,8 @@ typedef struct MesaPTAsyncBatch {
     MesaPTState *s;
     uint8_t *cmd;
     uint8_t *data;
+    uint32_t cmd_cap;   /* allocated words (used + slack) */
+    uint32_t data_cap;
 } MesaPTAsyncBatch;
 
 static void mesapt_async_batch_free(void *opaque)
@@ -2699,7 +2723,8 @@ static void mesapt_async_draw_run(void *opaque)
     MesaPTAsyncBatch *batch = opaque;
     MesaPTState *s = batch->s;
 
-    processFifoRegions(s, batch->cmd, batch->data, s->async_out_scratch);
+    processFifoRegions(s, batch->cmd, batch->data, s->async_out_scratch,
+                       batch->cmd_cap, batch->data_cap);
 
     /* Never leave the shared arg/data pointers aimed at a snapshot that will be
      * freed; the next synchronous processFifo() resets them, this is defensive. */
@@ -2716,32 +2741,57 @@ static void mesapt_async_draw_run(void *opaque)
  * synchronously (as 0xFC0). */
 static bool mesapt_try_async_draw(MesaPTState *s)
 {
-    uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
-    uint32_t *dataptr = (uint32_t *)(s->fifo_ptr + (MAX_FIFO << 2));
-    uint32_t fifo_words = fifoptr[0];
-    uint32_t data_words = dataptr[0];
+    uint32_t *fifoptr;
+    uint32_t *dataptr;
+    uint32_t fifo_words;
+    uint32_t data_words;
+    size_t cmd_bytes, data_bytes;
     MesaPTAsyncBatch *batch;
 
-    if (!(s->mglContext && s->mglCntxCurrent) || !qemu_fx_dispatch_ready()) {
+    if (!qemu_fx_dispatch_ready()) {
         return false;
     }
+
+    /* Reserve first: qemu_fx_async_reserve() is the only call here that can
+     * release the BQL. Everything after it -- context revalidation, cursor
+     * read, snapshot, live-cursor reset, and post -- runs with the BQL held
+     * continuously, so a concurrent reclaim/reset cannot delete the context or
+     * reset the ring under us. */
+    qemu_fx_async_reserve(MESAPT_ASYNC_MAX_INFLIGHT);
+
+    if (!(s->mglContext && s->mglCntxCurrent)) {
+        qemu_fx_async_cancel();
+        return false;   /* reclaimed during the reserve wait -> synchronous */
+    }
+    fifoptr = (uint32_t *)s->fifo_ptr;
+    dataptr = (uint32_t *)(s->fifo_ptr + (MAX_FIFO << 2));
+    fifo_words = fifoptr[0];
+    data_words = dataptr[0];
     if (fifo_words <= FIRST_FIFO) {
+        qemu_fx_async_cancel();
         return true;    /* nothing queued: handled as a no-op */
     }
     if (fifo_words >= MAX_FIFO ||
         data_words < (uint32_t)(ALIGNED(1) >> 2) || data_words >= MAX_DATA) {
+        qemu_fx_async_cancel();
         return false;   /* malformed: let the synchronous path validate it */
     }
 
-    /* Reserve BEFORE the snapshot and hold the BQL through the post so SMP
-     * admission stays ordered. */
-    qemu_fx_async_reserve(MESAPT_ASYNC_MAX_INFLIGHT);
+    cmd_bytes = ((size_t)fifo_words + MESAPT_ASYNC_CMD_SLACK) * sizeof(uint32_t);
+    data_bytes = ((size_t)data_words + MESAPT_ASYNC_DATA_SLACK) *
+                 sizeof(uint32_t);
+    if (cmd_bytes + data_bytes > MESAPT_ASYNC_MAX_SNAPSHOT_BYTES) {
+        qemu_fx_async_cancel();
+        return false;   /* oversized batch: sync (bounds retained memory) */
+    }
 
     batch = g_new0(MesaPTAsyncBatch, 1);
     batch->s = s;
-    batch->cmd = g_malloc((size_t)fifo_words * sizeof(uint32_t));
+    batch->cmd_cap = fifo_words + MESAPT_ASYNC_CMD_SLACK;
+    batch->data_cap = data_words + MESAPT_ASYNC_DATA_SLACK;
+    batch->cmd = g_malloc0(cmd_bytes);
     memcpy(batch->cmd, s->fifo_ptr, (size_t)fifo_words * sizeof(uint32_t));
-    batch->data = g_malloc((size_t)data_words * sizeof(uint32_t));
+    batch->data = g_malloc0(data_bytes);
     memcpy(batch->data, s->fifo_ptr + (MAX_FIFO << 2),
            (size_t)data_words * sizeof(uint32_t));
 
