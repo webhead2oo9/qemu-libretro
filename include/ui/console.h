@@ -512,20 +512,38 @@ void mesa_swap_notify(int top_down);
 void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque);
 
 /*
- * Asynchronous variant: enqueue a heap-owned command on the display/main-loop
- * thread and return WITHOUT waiting for it, so the guest vCPU can build the next
- * draw batch while the previous one renders. The queue is the same FIFO one used
- * by qemu_fx_run_on_main_thread(), so a later synchronous command cannot
- * complete until all previously-posted async commands ahead of it have run --
- * that ordering is the drain barrier for present/readback/result/reset. After
- * fn() runs the dispatcher calls free_opaque(opaque) and frees the request. The
- * caller holds the BQL; if in-flight async commands reach max_inflight the call
- * blocks (backpressure) until the main thread retires one. Only pure draw-flush
- * work that references solely the snapshotted FIFO+data may use this path.
+ * Asynchronous draw submission, in three parts, so the guest vCPU can build the
+ * next batch while the previous one renders on the display/main-loop thread.
+ * The async commands share the same FIFO dispatch queue as
+ * qemu_fx_run_on_main_thread(), so a later SYNCHRONOUS command cannot complete
+ * until every previously-posted async command ahead of it has run -- that FIFO
+ * ordering is the drain barrier for present/readback/result/context ops.
+ *
+ * All three require the BQL. Usage from an MMIO handler (vCPU thread):
+ *   qemu_fx_async_reserve(N);   -- backpressure: blocks while N async in flight
+ *   <snapshot the FIFO, reset the live cursors -- atomic under the held BQL>
+ *   qemu_fx_post_reserved(fn, snapshot, free_snapshot);  -- enqueue, no wait
+ * Reserving BEFORE the snapshot (and never releasing the BQL between snapshot
+ * and post) keeps SMP admission ordered. After fn() runs the dispatcher calls
+ * free_opaque(opaque), frees the request, and wakes reservation waiters.
+ *
+ * qemu_fx_drain_async() forces all pending async commands to complete before a
+ * state mutation that does NOT go through the dispatch queue (timer callbacks,
+ * device reset/finalize, session reclaim, context deletion, DLL unload). It is
+ * deadlock-safe: on the dispatch thread it runs the pending commands inline;
+ * off it, it waits.
+ *
+ * Only pure draw-flush work referencing solely the snapshotted FIFO+data may use
+ * this path; anything reading FBTM/output or retaining a pointer stays
+ * synchronous.
  */
-void qemu_fx_post_to_main_thread(void (*fn)(void *opaque), void *opaque,
-                                 void (*free_opaque)(void *opaque),
-                                 unsigned max_inflight);
+/* True once a display/main-loop dispatch thread exists and the caller is not
+ * that thread -- i.e. asynchronous draw submission can actually overlap. */
+bool qemu_fx_dispatch_ready(void);
+void qemu_fx_async_reserve(unsigned max_inflight);
+void qemu_fx_post_reserved(void (*fn)(void *opaque), void *opaque,
+                           void (*free_opaque)(void *opaque));
+void qemu_fx_drain_async(void);
 
 /*
  * Frame sink registered by the display frontend (ui/libretro.c) so the

@@ -47,7 +47,18 @@
 #endif
 
 
-typedef struct MesaPTState
+/* Asynchronous D3D draw submission: a distinct doorbell whose FIFO the host
+ * snapshots and replays on the dispatch thread while the guest refills, so the
+ * guest vCPU and host GL thread overlap instead of ping-ponging. At most
+ * MESAPT_ASYNC_MAX_INFLIGHT batches are posted-but-not-run (backpressure), plus
+ * one retained one-deep for client-array-pointer lifetime. */
+#define MESAPT_ASYNC_DRAW_DOORBELL 0xFB8
+#define MESAPT_ASYNC_MAX_INFLIGHT  2
+
+typedef struct MesaPTState MesaPTState;
+static void mesapt_drain_async(MesaPTState *s);
+
+struct MesaPTState
 {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -59,6 +70,11 @@ typedef struct MesaPTState
                          * (fifo_ptr-derived) for synchronous processing, or a
                          * snapshot/NULL for async draw batches (which never
                          * produce output) */
+    uint8_t *async_out_scratch; /* 3-page scratch output for async draw batches;
+                                 * batches are output-free, this only prevents a
+                                 * stray write from faulting */
+    void *async_retained;       /* previous async snapshot, freed one-deep once
+                                 * the next batch has re-set client arrays */
     int datacb, fifoMax, dataMax;
 
     MemoryRegion fbtm_ram;
@@ -138,7 +154,7 @@ typedef struct MesaPTState
     } *cpu_replies, io_reply;
     unsigned int cpu_reply_count;
 
-} MesaPTState;
+};
 
 static void mesapt_profile_reset(MesaPTState *s)
 {
@@ -252,6 +268,11 @@ static void mesapt_ring_reset(MesaPTState *s)
 
 static void mesapt_session_reclaim(MesaPTState *s, const char *reason)
 {
+    /* Complete any in-flight async draws before tearing down the GL context;
+     * this path runs from the heartbeat timer, bypassing the dispatch queue
+     * that would otherwise drain them. */
+    mesapt_drain_async(s);
+
     /* Clear the stale guest claim before another process can sniff-share it. */
     mesapt_ring_reset(s);
 
@@ -667,6 +688,9 @@ static uint32_t bitmapDataSize(MesaPTState *s, uint32_t width,
 static void dispTimerProcMain(void *opaque)
 {
     MesaPTState *s = opaque;
+    /* Display-cadence GL runs from a timer, off the dispatch queue: finish any
+     * in-flight async draws first so a presented frame reflects them. */
+    mesapt_drain_async(s);
     s->perfs.last();
     MGLActivateHandler(0, 1);
 }
@@ -2637,6 +2661,105 @@ static void ContextCreateCommon(MesaPTState *s)
     mesapt_profile_reset(s);
 }
 
+static void mesapt_renew_owner_liveness(MesaPTState *s)
+{
+    /* An accepted command from the active owner is liveness evidence; push the
+     * reclaim deadline out so a delayed timer cannot reclaim mid-batch. */
+    if (s->session_state == MESA_SESSION_OWNED && s->owner_heartbeat_enabled) {
+        s->owner_heartbeat_expiry =
+            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + MESA_HEARTBEAT_TTL;
+        timer_mod(s->owner_timer, s->owner_heartbeat_expiry);
+    }
+}
+
+typedef struct MesaPTAsyncBatch {
+    MesaPTState *s;
+    uint8_t *cmd;
+    uint8_t *data;
+} MesaPTAsyncBatch;
+
+static void mesapt_async_batch_free(void *opaque)
+{
+    MesaPTAsyncBatch *batch = opaque;
+
+    if (!batch) {
+        return;
+    }
+    g_free(batch->cmd);
+    g_free(batch->data);
+    g_free(batch);
+}
+
+/* Dispatch thread: replay one snapshotted pure-draw batch from its own
+ * {cmd,data} buffers, output routed to a scratch page (batches are output-free).
+ * Retained one-deep: freed only after the NEXT batch runs, so a client-array
+ * pointer set here still references live memory until it is re-set. */
+static void mesapt_async_draw_run(void *opaque)
+{
+    MesaPTAsyncBatch *batch = opaque;
+    MesaPTState *s = batch->s;
+
+    processFifoRegions(s, batch->cmd, batch->data, s->async_out_scratch);
+
+    /* Never leave the shared arg/data pointers aimed at a snapshot that will be
+     * freed; the next synchronous processFifo() resets them, this is defensive. */
+    s->arg = (uint32_t *)s->fifo_ptr;
+    s->hshm = (uint32_t *)(s->fifo_ptr + (MAX_FIFO << 2));
+
+    mesapt_async_batch_free(s->async_retained);
+    s->async_retained = batch;
+}
+
+/* vCPU thread, BQL held. Snapshot the queued pure-draw FIFO, free the live
+ * cursors so the guest can refill, and post the replay without waiting on GL.
+ * Returns false to decline, in which case the caller processes the doorbell
+ * synchronously (as 0xFC0). */
+static bool mesapt_try_async_draw(MesaPTState *s)
+{
+    uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
+    uint32_t *dataptr = (uint32_t *)(s->fifo_ptr + (MAX_FIFO << 2));
+    uint32_t fifo_words = fifoptr[0];
+    uint32_t data_words = dataptr[0];
+    MesaPTAsyncBatch *batch;
+
+    if (!(s->mglContext && s->mglCntxCurrent) || !qemu_fx_dispatch_ready()) {
+        return false;
+    }
+    if (fifo_words <= FIRST_FIFO) {
+        return true;    /* nothing queued: handled as a no-op */
+    }
+    if (fifo_words >= MAX_FIFO ||
+        data_words < (uint32_t)(ALIGNED(1) >> 2) || data_words >= MAX_DATA) {
+        return false;   /* malformed: let the synchronous path validate it */
+    }
+
+    /* Reserve BEFORE the snapshot and hold the BQL through the post so SMP
+     * admission stays ordered. */
+    qemu_fx_async_reserve(MESAPT_ASYNC_MAX_INFLIGHT);
+
+    batch = g_new0(MesaPTAsyncBatch, 1);
+    batch->s = s;
+    batch->cmd = g_malloc((size_t)fifo_words * sizeof(uint32_t));
+    memcpy(batch->cmd, s->fifo_ptr, (size_t)fifo_words * sizeof(uint32_t));
+    batch->data = g_malloc((size_t)data_words * sizeof(uint32_t));
+    memcpy(batch->data, s->fifo_ptr + (MAX_FIFO << 2),
+           (size_t)data_words * sizeof(uint32_t));
+
+    fifoptr[0] = FIRST_FIFO;
+    dataptr[0] = ALIGNED(1) >> 2;
+
+    mesapt_renew_owner_liveness(s);
+    qemu_fx_post_reserved(mesapt_async_draw_run, batch, NULL);
+    return true;
+}
+
+static void mesapt_drain_async(MesaPTState *s)
+{
+    qemu_fx_drain_async();
+    mesapt_async_batch_free(s->async_retained);
+    s->async_retained = NULL;
+}
+
 typedef struct MesaPTWriteRequest {
     MesaPTState *s;
     struct MesaPTReply *reply;
@@ -3234,10 +3357,20 @@ static void mesapt_write_main(void *opaque)
 
 static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
-    MesaPTWriteRequest request = {
+    MesaPTState *s = opaque;
+    MesaPTWriteRequest request;
+
+    /* Asynchronous draw doorbell: snapshot + post on this vCPU thread without
+     * waiting on GL. If it declines (no owner/context/dispatch, or malformed),
+     * fall through and process it synchronously exactly as the 0xFC0 doorbell. */
+    if (addr == MESAPT_ASYNC_DRAW_DOORBELL && mesapt_try_async_draw(s)) {
+        return;
+    }
+
+    request = (MesaPTWriteRequest){
         .s = opaque,
         .reply = mesapt_reply_for_cpu(opaque),
-        .addr = addr,
+        .addr = (addr == MESAPT_ASYNC_DRAW_DOORBELL) ? 0xFC0 : addr,
         .val = val,
         .size = size,
     };
@@ -3259,6 +3392,7 @@ static void mesapt_reset(DeviceState *d)
 {
     MesaPTState *s = MESAPT(d);
 
+    mesapt_drain_async(s);
     mesapt_session_release(s, "device reset");
     if (s->cpu_replies) {
         memset(s->cpu_replies, 0,
@@ -3279,6 +3413,12 @@ static void mesapt_init(Object *obj)
     s->fbtm_ptr = memory_region_get_ram_ptr(&s->fbtm_ram);
     memory_region_add_subregion(sysmem, MESA_FIFO_BASE, &s->fifo_ram);
     memory_region_add_subregion(sysmem, MESA_FBTM_BASE, &s->fbtm_ram);
+
+    /* Scratch output region for async draw batches. Batches are output-free
+     * (output ops go through the synchronous path), so this is only touched by
+     * a stray write and never carries real results. */
+    s->async_out_scratch = g_malloc0(3 * PAGE_SIZE);
+    s->async_retained = NULL;
 
     memory_region_init_io(&s->iomem, obj, &mesapt_ops, s, TYPE_MESAPT, PAGE_SIZE);
     /* A doorbell callback waits for main-loop GL dispatch with the BQL
@@ -3304,6 +3444,9 @@ static void mesapt_finalize(Object *obj)
 {
     MesaPTState *s = MESAPT(obj);
 
+    mesapt_drain_async(s);
+    g_free(s->async_out_scratch);
+    s->async_out_scratch = NULL;
     mesapt_session_release(s, "device finalize");
     if (s->owner_timer) {
         timer_free(s->owner_timer);

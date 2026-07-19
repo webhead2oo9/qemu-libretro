@@ -166,15 +166,42 @@ void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque)
     }
 }
 
-void qemu_fx_post_to_main_thread(void (*fn)(void *opaque), void *opaque,
-                                 void (*free_opaque)(void *opaque),
-                                 unsigned max_inflight)
+bool qemu_fx_dispatch_ready(void)
+{
+    return fx.dispatch_initialized &&
+           !qemu_thread_is_self(&fx.dispatch_thread);
+}
+
+void qemu_fx_async_reserve(unsigned max_inflight)
+{
+    /*
+     * Reserve one async in-flight slot, blocking (releasing the BQL) while the
+     * bound is reached. Called on a vCPU thread BEFORE snapshotting the FIFO so
+     * SMP admission stays ordered: the caller holds the BQL from here through
+     * the matching qemu_fx_post_reserved() without releasing it, so no other
+     * submitter can interleave a snapshot/reset between the two.
+     */
+    if (!fx.dispatch_initialized ||
+        qemu_thread_is_self(&fx.dispatch_thread)) {
+        return;
+    }
+    g_assert(bql_locked());
+    if (max_inflight < 1) {
+        max_inflight = 1;
+    }
+    while (fx.async_inflight >= max_inflight) {
+        qemu_cond_wait_bql(&fx.dispatch_cond);
+    }
+    fx.async_inflight++;
+}
+
+void qemu_fx_post_reserved(void (*fn)(void *opaque), void *opaque,
+                           void (*free_opaque)(void *opaque))
 {
     QemuFxDispatchRequest *request;
 
-    /* Before the dispatch thread exists, or when already on it, running inline
-     * preserves ordering (the caller's own later synchronous commands still
-     * see this one's effects). */
+    /* No dispatch thread yet, or already on it: run inline. In that case
+     * qemu_fx_async_reserve() no-oped, so there is no reserved slot to free. */
     if (!fx.dispatch_initialized ||
         qemu_thread_is_self(&fx.dispatch_thread)) {
         fn(opaque);
@@ -183,25 +210,50 @@ void qemu_fx_post_to_main_thread(void (*fn)(void *opaque), void *opaque,
         }
         return;
     }
-
     g_assert(bql_locked());
-    if (max_inflight < 1) {
-        max_inflight = 1;
-    }
-    /* Bound host memory and latency: block until the main thread retires an
-     * in-flight async command. Degrades to synchronous-like pacing under
-     * pressure; never unbounded. */
-    while (fx.async_inflight >= max_inflight) {
-        qemu_cond_wait_bql(&fx.dispatch_cond);
-    }
     request = g_new0(QemuFxDispatchRequest, 1);
     request->fn = fn;
     request->opaque = opaque;
     request->free_opaque = free_opaque;
     request->async = true;
-    fx.async_inflight++;
+    /* The slot was already counted by qemu_fx_async_reserve(); the dispatch BH
+     * releases it after fn() runs. */
     QTAILQ_INSERT_TAIL(&fx.dispatch_queue, request, next);
     qemu_bh_schedule(fx.dispatch_bh);
+}
+
+void qemu_fx_drain_async(void)
+{
+    if (!fx.dispatch_initialized) {
+        return;
+    }
+    if (qemu_thread_is_self(&fx.dispatch_thread)) {
+        /* On the dispatch thread a blocking wait would deadlock: this is the
+         * thread that runs the queued commands. Run the pending ASYNC requests
+         * inline, in FIFO order, and leave any synchronous request for its own
+         * waiter. The guest transport lock guarantees no async request is
+         * queued behind a still-pending synchronous one, so this preserves
+         * submission order. */
+        QemuFxDispatchRequest *request, *tmp;
+        QTAILQ_FOREACH_SAFE(request, &fx.dispatch_queue, next, tmp) {
+            if (!request->async) {
+                continue;
+            }
+            QTAILQ_REMOVE(&fx.dispatch_queue, request, next);
+            request->fn(request->opaque);
+            if (request->free_opaque) {
+                request->free_opaque(request->opaque);
+            }
+            fx.async_inflight--;
+            g_free(request);
+        }
+        qemu_cond_broadcast(&fx.dispatch_cond);
+        return;
+    }
+    g_assert(bql_locked());
+    while (fx.async_inflight > 0) {
+        qemu_cond_wait_bql(&fx.dispatch_cond);
+    }
 }
 
 void qemu_fx_register_sink(const QemuFxSink *sink)
