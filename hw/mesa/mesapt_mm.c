@@ -61,6 +61,12 @@
 /* Batches whose snapshot would exceed this fall back to synchronous processing,
  * bounding retained async memory (<= (MAX_INFLIGHT+1) * this). */
 #define MESAPT_ASYNC_MAX_SNAPSHOT_BYTES (16u * 1024u * 1024u)
+/* Capability register (read 0xFAC): an async-capable host returns this exact
+ * value; older hosts return the read default 0, so a /4-aware guest that reads a
+ * mismatch simply keeps using the synchronous 0xFC0 doorbell. The wire packet
+ * ABI (QXPD3D/3) is unchanged -- async is an orthogonal transport capability. */
+#define MESAPT_ASYNC_CAP_ADDR  0xFAC
+#define MESAPT_ASYNC_CAP_V4    0x41535904u
 
 typedef struct MesaPTState MesaPTState;
 static void mesapt_drain_async(MesaPTState *s);
@@ -744,6 +750,11 @@ static uint64_t mesapt_read(void *opaque, hwaddr addr, unsigned size)
             if (!val && reply->refused) {
                 val = MESA_BUSY;
             }
+            break;
+        case MESAPT_ASYNC_CAP_ADDR:
+            /* Static host capability: asynchronous draw submission via the
+             * 0xFB8 write doorbell is available. */
+            val = MESAPT_ASYNC_CAP_V4;
             break;
         case 0xFBC:
             val = reply->mesa_ver;
