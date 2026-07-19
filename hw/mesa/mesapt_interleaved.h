@@ -7,6 +7,26 @@
 
 #define MESAPT_D3D_INTERLEAVED_BASE 0x73000000U
 #define MESAPT_D3D_INTERLEAVED_SPAN 0x00010000U
+#define MESAPT_QXPD3D_SIGNATURE_BYTES 8U
+
+/* Returns the exact QXPD3D attachment version, or zero for any other byte
+ * sequence. Versions 2 and 3 both negotiate the shared interleaved host path;
+ * version 3 accompanies guest draw-packet ABI 47's one-copy indexed layout. */
+static inline uint8_t mesapt_qxpd3d_signature_version(
+    const uint8_t signature[MESAPT_QXPD3D_SIGNATURE_BYTES])
+{
+    static const uint8_t prefix[7] = {
+        'Q', 'X', 'P', 'D', '3', 'D', 0
+    };
+    size_t index;
+
+    if (!signature) return 0;
+    for (index = 0; index < sizeof(prefix); ++index) {
+        if (signature[index] != prefix[index]) return 0;
+    }
+    if (signature[7] < 1 || signature[7] > 3) return 0;
+    return signature[7];
+}
 
 typedef struct MesaptInterleavedArray {
     bool enabled;

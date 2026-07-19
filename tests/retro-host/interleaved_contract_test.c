@@ -13,6 +13,25 @@ int main(void)
 {
     MesaptInterleavedArray arrays[3] = { 0 };
     MesaptInterleavedLayout layout;
+    uint8_t signature[MESAPT_QXPD3D_SIGNATURE_BYTES] = {
+        'Q', 'X', 'P', 'D', '3', 'D', 0, 1
+    };
+
+    if (!require(mesapt_qxpd3d_signature_version(signature) == 1,
+                 "rejected QXPD3D/1 signature")) return 1;
+    signature[7] = 2;
+    if (!require(mesapt_qxpd3d_signature_version(signature) == 2,
+                 "rejected QXPD3D/2 signature")) return 1;
+    signature[7] = 3;
+    if (!require(mesapt_qxpd3d_signature_version(signature) == 3,
+                 "rejected QXPD3D/3 signature")) return 1;
+    signature[7] = 4;
+    if (!require(mesapt_qxpd3d_signature_version(signature) == 0,
+                 "accepted unknown QXPD3D signature")) return 1;
+    signature[7] = 3;
+    signature[5] = 'E';
+    if (!require(mesapt_qxpd3d_signature_version(signature) == 0,
+                 "accepted malformed QXPD3D signature")) return 1;
 
     arrays[0].enabled = true;
     arrays[0].handle = MESAPT_D3D_INTERLEAVED_BASE;

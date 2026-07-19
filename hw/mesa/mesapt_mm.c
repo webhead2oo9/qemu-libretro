@@ -211,14 +211,6 @@ static const uint8_t qxpicd_signature[8] = {
     'Q', 'X', 'P', 'I', 'C', 'D', 0, MESA_PROBE_VER
 };
 
-static const uint8_t qxpd3d_signature_v1[8] = {
-    'Q', 'X', 'P', 'D', '3', 'D', 0, MESA_PROBE_VER
-};
-
-static const uint8_t qxpd3d_signature_v2[8] = {
-    'Q', 'X', 'P', 'D', '3', 'D', 0, 2
-};
-
 static struct MesaPTReply *mesapt_reply_for_cpu(MesaPTState *s)
 {
     if (current_cpu && current_cpu->cpu_index >= 0 &&
@@ -2706,6 +2698,7 @@ static void mesapt_write_main(void *opaque)
         s->session_state == MESA_SESSION_OWNED &&
         s->owner_heartbeat_enabled;
     int64_t profile_start_us = 0;
+    uint8_t qxpd3d_signature_version = 0;
 
     if (addr == 0xFC0 ||
         (val == MESAGL_MAGIC && (addr == 0xFD4 || addr == 0xFF0))) {
@@ -2769,22 +2762,18 @@ static void mesapt_write_main(void *opaque)
                     break;
                 }
                 s->MesaVer = 0;
+                qxpd3d_signature_version =
+                    mesapt_qxpd3d_signature_version(
+                        s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1));
                 if ((memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
                             rev_, ALIGNED(1)) == 0 ||
                      memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
                             qxpicd_signature,
                             sizeof(qxpicd_signature)) == 0 ||
-                     memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
-                             qxpd3d_signature_v1,
-                             sizeof(qxpd3d_signature_v1)) == 0 ||
-                     memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
-                             qxpd3d_signature_v2,
-                             sizeof(qxpd3d_signature_v2)) == 0) &&
+                     qxpd3d_signature_version) &&
                     (InitMesaGL() == 0)) {
                     s->qxpd3d_interleaved =
-                        memcmp(s->fbtm_ptr + MGLFBT_SIZE - ALIGNBO(1),
-                               qxpd3d_signature_v2,
-                               sizeof(qxpd3d_signature_v2)) == 0;
+                        qxpd3d_signature_version >= 2;
                     s->MesaVer = (uint32_t)((val >> 12) & 0xFFU) | ((val & 0xFFFU) << 8);
                     s->mglCntxAtt = 0;
                     MGLTmpContext();
