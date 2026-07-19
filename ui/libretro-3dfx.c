@@ -63,7 +63,9 @@ typedef struct QemuFxDispatchRequest {
     QTAILQ_ENTRY(QemuFxDispatchRequest) next;
     void (*fn)(void *opaque);
     void *opaque;
+    void (*free_opaque)(void *opaque); /* async only: frees opaque after fn */
     bool done;
+    bool async;                        /* heap-owned, no stack waiter */
 } QemuFxDispatchRequest;
 
 typedef QTAILQ_HEAD(QemuFxDispatchQueue, QemuFxDispatchRequest)
@@ -115,6 +117,7 @@ static struct {
     QemuCond dispatch_cond;
     QEMUBH *dispatch_bh;
     QemuFxDispatchQueue dispatch_queue;
+    unsigned async_inflight;    /* posted-but-not-yet-run async commands */
     bool dispatch_initialized;
 } fx;
 
@@ -126,7 +129,18 @@ static void qemu_fx_dispatch_bh(void *opaque)
     while ((request = QTAILQ_FIRST(&fx.dispatch_queue)) != NULL) {
         QTAILQ_REMOVE(&fx.dispatch_queue, request, next);
         request->fn(request->opaque);
-        request->done = true;
+        if (request->async) {
+            /* Heap-owned: no vCPU is waiting on this request. Free the
+             * snapshot and the request, then wake any vCPU blocked on the
+             * async in-flight backpressure bound. */
+            if (request->free_opaque) {
+                request->free_opaque(request->opaque);
+            }
+            fx.async_inflight--;
+            g_free(request);
+        } else {
+            request->done = true;
+        }
         qemu_cond_broadcast(&fx.dispatch_cond);
     }
 }
@@ -150,6 +164,44 @@ void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque)
     while (!request.done) {
         qemu_cond_wait_bql(&fx.dispatch_cond);
     }
+}
+
+void qemu_fx_post_to_main_thread(void (*fn)(void *opaque), void *opaque,
+                                 void (*free_opaque)(void *opaque),
+                                 unsigned max_inflight)
+{
+    QemuFxDispatchRequest *request;
+
+    /* Before the dispatch thread exists, or when already on it, running inline
+     * preserves ordering (the caller's own later synchronous commands still
+     * see this one's effects). */
+    if (!fx.dispatch_initialized ||
+        qemu_thread_is_self(&fx.dispatch_thread)) {
+        fn(opaque);
+        if (free_opaque) {
+            free_opaque(opaque);
+        }
+        return;
+    }
+
+    g_assert(bql_locked());
+    if (max_inflight < 1) {
+        max_inflight = 1;
+    }
+    /* Bound host memory and latency: block until the main thread retires an
+     * in-flight async command. Degrades to synchronous-like pacing under
+     * pressure; never unbounded. */
+    while (fx.async_inflight >= max_inflight) {
+        qemu_cond_wait_bql(&fx.dispatch_cond);
+    }
+    request = g_new0(QemuFxDispatchRequest, 1);
+    request->fn = fn;
+    request->opaque = opaque;
+    request->free_opaque = free_opaque;
+    request->async = true;
+    fx.async_inflight++;
+    QTAILQ_INSERT_TAIL(&fx.dispatch_queue, request, next);
+    qemu_bh_schedule(fx.dispatch_bh);
 }
 
 void qemu_fx_register_sink(const QemuFxSink *sink)

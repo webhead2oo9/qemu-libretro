@@ -55,6 +55,10 @@ typedef struct MesaPTState
     MemoryRegion fifo_ram;
     uint8_t *fifo_ptr;
     uint32_t *arg, *hshm;
+    uint8_t *rgn_out;   /* output region base for the active batch: live
+                         * (fifo_ptr-derived) for synchronous processing, or a
+                         * snapshot/NULL for async draw batches (which never
+                         * produce output) */
     int datacb, fifoMax, dataMax;
 
     MemoryRegion fbtm_ram;
@@ -842,7 +846,7 @@ static int PArgsShouldAligned(MesaPTState *s)
 #define VAL(x) (uintptr_t)x
 static void processArgs(MesaPTState *s)
 {
-    uint8_t *outshm = s->fifo_ptr + (MGLSHM_SIZE - (3*PAGE_SIZE));
+    uint8_t *outshm = s->rgn_out;
 
     switch (s->FEnum) {
         case FEnum_glAreProgramsResidentNV:
@@ -2229,7 +2233,7 @@ static void processArgs(MesaPTState *s)
 
 static void processFRet(MesaPTState *s)
 {
-    uint8_t *outshm = s->fifo_ptr + (MGLSHM_SIZE - (3*PAGE_SIZE));
+    uint8_t *outshm = s->rgn_out;
 
     if (PArgsShouldAligned(s) == 0) {
         s->parg[0] &= ~(sizeof(uintptr_t) - 1);
@@ -2546,16 +2550,18 @@ static void processFRet(MesaPTState *s)
     }
 }
 
-static void processFifo(MesaPTState *s)
+static void processFifoRegions(MesaPTState *s, uint8_t *cmd_base,
+                               uint8_t *data_base, uint8_t *out_base)
 {
-    uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
-    uint32_t *dataptr = (uint32_t *)(s->fifo_ptr + (MAX_FIFO << 2));
+    uint32_t *fifoptr = (uint32_t *)cmd_base;
+    uint32_t *dataptr = (uint32_t *)data_base;
     int FEnum = s->FEnum, i = FIRST_FIFO, j = ALIGNED(1) >> 2;
     struct {
         uint32_t fifo;
         uint32_t data;
     } fifostat = { .fifo = 0, .data = 0 };
 
+    s->rgn_out = out_base;
     if (fifoptr[0] - FIRST_FIFO) {
         fifostat.fifo = fifoptr[0];
         fifostat.data = dataptr[0];
@@ -2604,6 +2610,20 @@ static void processFifo(MesaPTState *s)
         s->dataMax = (s->dataMax < dataptr[0])? dataptr[0]:s->dataMax;
         dataptr[0] -= j;
     }
+}
+
+/*
+ * Live-region entry: process the guest's shared FIFO in place. Command, data,
+ * and output regions sit at fixed offsets in the mapping. Async draw submission
+ * calls processFifoRegions() directly with compact snapshot bases and a NULL
+ * output base (output-producing FEnums are excluded from async batches
+ * upstream, so they never dereference it).
+ */
+static void processFifo(MesaPTState *s)
+{
+    processFifoRegions(s, s->fifo_ptr,
+                       s->fifo_ptr + (MAX_FIFO << 2),
+                       s->fifo_ptr + (MGLSHM_SIZE - (3 * PAGE_SIZE)));
 }
 
 static void ContextCreateCommon(MesaPTState *s)

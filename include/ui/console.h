@@ -512,6 +512,22 @@ void mesa_swap_notify(int top_down);
 void qemu_fx_run_on_main_thread(void (*fn)(void *opaque), void *opaque);
 
 /*
+ * Asynchronous variant: enqueue a heap-owned command on the display/main-loop
+ * thread and return WITHOUT waiting for it, so the guest vCPU can build the next
+ * draw batch while the previous one renders. The queue is the same FIFO one used
+ * by qemu_fx_run_on_main_thread(), so a later synchronous command cannot
+ * complete until all previously-posted async commands ahead of it have run --
+ * that ordering is the drain barrier for present/readback/result/reset. After
+ * fn() runs the dispatcher calls free_opaque(opaque) and frees the request. The
+ * caller holds the BQL; if in-flight async commands reach max_inflight the call
+ * blocks (backpressure) until the main thread retires one. Only pure draw-flush
+ * work that references solely the snapshotted FIFO+data may use this path.
+ */
+void qemu_fx_post_to_main_thread(void (*fn)(void *opaque), void *opaque,
+                                 void (*free_opaque)(void *opaque),
+                                 unsigned max_inflight);
+
+/*
  * Frame sink registered by the display frontend (ui/libretro.c) so the
  * glue can deliver frames it read out of the pass-through GL context.
  * All hooks run with the BQL held. Host GL work is marshalled to the
