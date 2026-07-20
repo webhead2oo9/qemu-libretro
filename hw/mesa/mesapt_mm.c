@@ -36,6 +36,17 @@
 #define MESAPT_PROFILE_FENUM_MAX 0x800
 #define MESAPT_PROFILE_TOP 8
 
+/* Queue-inclusive synchronous doorbell wait classes (SyncWaitProfile). */
+enum {
+    MESAPT_SYNC_WAIT_HEARTBEAT = 0,  /* 0xFB0 */
+    MESAPT_SYNC_WAIT_SWAP,           /* 0xFF0 */
+    MESAPT_SYNC_WAIT_PUBLISH,        /* 0xFD4 */
+    MESAPT_SYNC_WAIT_DIRECT,         /* 0xFC0, incl. declined async fallback */
+    MESAPT_SYNC_WAIT_ASYNC_DRAW,     /* 0xFB8 accepted (reserve backpressure) */
+    MESAPT_SYNC_WAIT_OTHER,
+    MESAPT_SYNC_WAIT_CLASSES,
+};
+
 #ifdef DEBUG_MESAPT
 #define DPRINTF(fmt, ...) \
     do { fprintf(stderr, "mesapt: " fmt "\n" , ## __VA_ARGS__); } while(0)
@@ -134,6 +145,15 @@ struct MesaPTState
     uint32_t profile_publish_calls;
     uint32_t profile_swap_calls;
 
+    /* Queue-inclusive sync doorbell wait (vCPU side): measured from
+     * mesapt_write entry to main-thread completion, so the BH queue wait
+     * before mesapt_write_main runs — invisible to the in-handler timers
+     * above — is included. */
+    uint64_t sync_wait_us[MESAPT_SYNC_WAIT_CLASSES];
+    uint64_t sync_wait_max_us[MESAPT_SYNC_WAIT_CLASSES];
+    uint32_t sync_wait_calls[MESAPT_SYNC_WAIT_CLASSES];
+    uint32_t sync_wait_ge250ms[MESAPT_SYNC_WAIT_CLASSES];
+
     /* Explicit single-owner session state. Numeric values are part of the
      * MESA_PROBE response, so keep FREE/RESERVED/OWNED at 0/1/2. */
     enum {
@@ -169,6 +189,39 @@ struct MesaPTState
 
 };
 
+static const char *const mesapt_sync_wait_names[MESAPT_SYNC_WAIT_CLASSES] = {
+    "heartbeat(0xFB0)", "swap(0xFF0)", "publish(0xFD4)", "direct(0xFC0)",
+    "async-draw(0xFB8)", "other",
+};
+
+static unsigned mesapt_sync_wait_class(hwaddr addr)
+{
+    switch (addr) {
+    case 0xFB0: return MESAPT_SYNC_WAIT_HEARTBEAT;
+    case 0xFF0: return MESAPT_SYNC_WAIT_SWAP;
+    case 0xFD4: return MESAPT_SYNC_WAIT_PUBLISH;
+    case 0xFC0: return MESAPT_SYNC_WAIT_DIRECT;
+    default:    return MESAPT_SYNC_WAIT_OTHER;
+    }
+}
+
+static void mesapt_sync_wait_record(MesaPTState *s, unsigned cls, int64_t t0)
+{
+    int64_t dt = g_get_monotonic_time() - t0;
+
+    if (dt < 0) {
+        dt = 0;
+    }
+    s->sync_wait_us[cls] += (uint64_t)dt;
+    s->sync_wait_calls[cls]++;
+    if ((uint64_t)dt > s->sync_wait_max_us[cls]) {
+        s->sync_wait_max_us[cls] = (uint64_t)dt;
+    }
+    if (dt >= 250000) {
+        s->sync_wait_ge250ms[cls]++;
+    }
+}
+
 static void mesapt_profile_reset(MesaPTState *s)
 {
     memset(s->profile_direct_us, 0, sizeof(s->profile_direct_us));
@@ -177,6 +230,10 @@ static void mesapt_profile_reset(MesaPTState *s)
     s->profile_swap_us = 0;
     s->profile_publish_calls = 0;
     s->profile_swap_calls = 0;
+    memset(s->sync_wait_us, 0, sizeof(s->sync_wait_us));
+    memset(s->sync_wait_max_us, 0, sizeof(s->sync_wait_max_us));
+    memset(s->sync_wait_calls, 0, sizeof(s->sync_wait_calls));
+    memset(s->sync_wait_ge250ms, 0, sizeof(s->sync_wait_ge250ms));
 }
 
 static void mesapt_profile_dump(MesaPTState *s)
@@ -237,6 +294,17 @@ static void mesapt_profile_dump(MesaPTState *s)
                 s->profile_direct_calls[best], s->profile_direct_us[best],
                 s->profile_direct_us[best] /
                     s->profile_direct_calls[best]);
+    }
+    for (unsigned int cls = 0; cls < MESAPT_SYNC_WAIT_CLASSES; cls++) {
+        if (!s->sync_wait_calls[cls]) {
+            continue;
+        }
+        DPRINTF("SyncWaitProfile %s calls %u total %" PRIu64
+                " us avg %" PRIu64 " us max %" PRIu64 " us ge250ms %u",
+                mesapt_sync_wait_names[cls], s->sync_wait_calls[cls],
+                s->sync_wait_us[cls],
+                s->sync_wait_us[cls] / s->sync_wait_calls[cls],
+                s->sync_wait_max_us[cls], s->sync_wait_ge250ms[cls]);
     }
 }
 
@@ -3420,11 +3488,13 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     MesaPTState *s = opaque;
     MesaPTWriteRequest request;
+    int64_t sync_wait_t0 = g_get_monotonic_time();
 
     /* Asynchronous draw doorbell: snapshot + post on this vCPU thread without
      * waiting on GL. If it declines (no owner/context/dispatch, or malformed),
      * fall through and process it synchronously exactly as the 0xFC0 doorbell. */
     if (addr == MESAPT_ASYNC_DRAW_DOORBELL && mesapt_try_async_draw(s)) {
+        mesapt_sync_wait_record(s, MESAPT_SYNC_WAIT_ASYNC_DRAW, sync_wait_t0);
         return;
     }
 
@@ -3437,6 +3507,8 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     };
 
     qemu_fx_run_on_main_thread(mesapt_write_main, &request);
+    mesapt_sync_wait_record(s, mesapt_sync_wait_class(request.addr),
+                            sync_wait_t0);
 }
 
 static const MemoryRegionOps mesapt_ops = {
