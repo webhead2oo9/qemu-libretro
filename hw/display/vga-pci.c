@@ -386,6 +386,22 @@ static void vga_class_init(ObjectClass *klass, void *data)
     k->realize = pci_std_vga_realize;
     k->romfile = "vgabios-stdvga.bin";
     k->class_id = PCI_CLASS_DISPLAY_VGA;
+    /*
+     * XPDriver identity dial (first rung): present the concrete primary
+     * "VGA" adapter as an NVIDIA GeForce4 Ti 4600 (10DE:0250) so XP-era
+     * titles that gate on a GPU whitelist accept the device.  Keep a
+     * QEMU/virtio subsystem fingerprint (1AF4:1100): it stays honestly a
+     * VM, and it lets the guest XPDriver INF match this device more
+     * specifically (VEN_10DE&DEV_0250&SUBSYS_11001AF4) than any real NVIDIA
+     * INF, preventing XP from binding an inbox NVIDIA driver.  secondary-vga
+     * and bochs-display keep QEMU 1234:1111 (they inherit the abstract
+     * vga_pci_class_init unchanged).  Class code, BARs, ROM and VBE
+     * behaviour are untouched, so the VGA BIOS / boot path is unaffected.
+     */
+    k->vendor_id = PCI_VENDOR_ID_NVIDIA;
+    k->device_id = 0x0250; /* NV25 GeForce4 Ti 4600 */
+    k->subsystem_vendor_id = PCI_SUBVENDOR_ID_REDHAT_QUMRANET;
+    k->subsystem_id = PCI_SUBDEVICE_ID_QEMU;
     device_class_set_props(dc, vga_pci_properties);
     dc->hotpluggable = false;
 
