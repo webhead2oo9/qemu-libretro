@@ -218,6 +218,31 @@ static bool present_valid = false;	// frontend thread only
 // stands down so the stale surface cannot overwrite them. Written and
 // read under the BQL only.
 static bool fx_active;
+static int64_t fx_last_publish_us;	/* monotonic time of the last 3D publish */
+
+/* While 3D actively presents, the 2D/VGA surface yields the screen. The
+ * renderer toggles inactive between frames (and a slow game's frames can be
+ * seconds apart), so keep standing down until no 3D frame has arrived for this
+ * long -- otherwise the desktop flashes black between live 3D frames. A
+ * genuine mode-change resets it so 2D reclaims the screen immediately. */
+#define FX_2D_RECLAIM_US ((int64_t)4 * 1000000)
+
+/* TEMP flicker-diag: count 2D(VGA) vs 3D(fx) publishes and log fx_active
+ * toggles to a fixed file. Remove once the flicker is fixed. */
+static unsigned long g_diag_vga_pub, g_diag_fx_pub;
+static void fx_diag_toggle_log(int on)
+{
+	static FILE *f;
+	if (!f) {
+		f = fopen("C:\\Users\\charlie\\dev\\XPDriver\\host-fxactive-diag.log", "w");
+		if (!f) {
+			return;
+		}
+	}
+	fprintf(f, "fx_active=%d vga_pub=%lu fx_pub=%lu t_us=%lld\n", on,
+		g_diag_vga_pub, g_diag_fx_pub, (long long)g_get_monotonic_time());
+	fflush(f);
+}
 #ifdef CONFIG_QEMU_3DFX
 /* retro_run heartbeat: incremented by the frontend thread and sampled by
  * the 3D readback thread so capture can stop while the frontend is idle. */
@@ -934,6 +959,9 @@ static void gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface)
 		av_info.geometry.base_height = h;
 		changed_geometry = true;
 		pthread_mutex_unlock(&av_info_lock);
+		/* Genuine mode-change: end any 3D-present grace so the 2D surface
+		 * (new desktop/menu at this resolution) is presented at once. */
+		fx_last_publish_us = 0;
 	}
 	surface = new_surface;
 	surface_damaged = true;
@@ -960,7 +988,8 @@ static void refresh(DisplayChangeListener *dcl)
 	// gfx_switch and the fx handoff force the flag, so geometry
 	// changes always publish a real frame (the frontend re-inits its
 	// video driver to black on those and needs one to recover).
-	if (surface && !fx_active && surface_damaged) {
+	if (surface && !fx_active && surface_damaged &&
+	    g_get_monotonic_time() - fx_last_publish_us >= FX_2D_RECLAIM_US) {
 		surface_damaged = false;
 		int w = surface_width(surface);
 		int h = surface_height(surface);
@@ -979,6 +1008,7 @@ static void refresh(DisplayChangeListener *dcl)
 		}
 		pending_frame.bottom_up = false;
 		pending_updated = true;
+		g_diag_vga_pub++;
 		pthread_mutex_unlock(&frame_mutex);
 	}
 }
@@ -1013,6 +1043,8 @@ static void fx_sink_publish(const void *pixels, int w, int h,
 	pending_ensure(w, h);
 	memcpy(pending_frame.buf, pixels, (size_t)w * h * 4);
 	pending_frame.bottom_up = !top_down;
+	g_diag_fx_pub++;
+	fx_last_publish_us = g_get_monotonic_time();
 	pthread_mutex_unlock(&frame_mutex);
 
 	/* retro_run observes AV state and the pending-frame flag together under
@@ -1045,6 +1077,7 @@ static void fx_sink_publish(const void *pixels, int w, int h,
 static void fx_sink_set_active(bool on)
 {
 	fx_active = on;
+	fx_diag_toggle_log(on);
 	// returning to 2D: force one publish even if the console reports
 	// no fresh damage
 	if (!on) {

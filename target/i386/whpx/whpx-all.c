@@ -2384,16 +2384,32 @@ static struct {
     uint64_t mmio_page[WHPX_EXIT_PROFILE_MMIO_SLOTS];
     uint64_t mmio_count[WHPX_EXIT_PROFILE_MMIO_SLOTS];
     uint64_t mmio_overflow;
+    uint64_t guest_run_us;   /* XPD-DIAG: time inside WHvRunVirtualProcessor */
+    uint64_t exit_handle_us; /* XPD-DIAG: time handling exits (outside Run) */
 } whpx_exit_prof;
+static __thread int64_t whpx_xpd_last_ret_us; /* XPD-DIAG: per-vCPU last Run return */
 
 static void whpx_exit_profile_dump(int64_t now_us)
 {
     double secs = (now_us - whpx_exit_prof.window_start_us) / 1e6;
+    /* XPD-DIAG: RetroArch swallows the core's stderr; mirror the exit
+     * histogram to a file. Remove per XPDriver/DIAGNOSTICS-TEMP.md. */
+    FILE *xf = fopen("C:\\Users\\charlie\\dev\\XPDriver\\"
+                     "host-whpxexit-diag.log", "a");
 
     fprintf(stderr, "WhpxExitProfile window %.2f s total %" PRIu64
             " mmio %" PRIu64 " pio %" PRIu64 " other %" PRIu64 "\n",
             secs, whpx_exit_prof.total, whpx_exit_prof.reason_mmio,
             whpx_exit_prof.reason_pio, whpx_exit_prof.reason_other);
+    if (xf) {
+        fprintf(xf, "=== window %.2f s total %" PRIu64 " mmio %" PRIu64
+                " pio %" PRIu64 " other %" PRIu64
+                " guest_run %" PRIu64 " ms exit_handle %" PRIu64 " ms ===\n",
+                secs, whpx_exit_prof.total, whpx_exit_prof.reason_mmio,
+                whpx_exit_prof.reason_pio, whpx_exit_prof.reason_other,
+                whpx_exit_prof.guest_run_us / 1000,
+                whpx_exit_prof.exit_handle_us / 1000);
+    }
     for (int rank = 0; rank < WHPX_EXIT_PROFILE_TOP_PORTS; rank++) {
         uint32_t best_count = 0;
         uint32_t best_port = 0;
@@ -2409,6 +2425,9 @@ static void whpx_exit_profile_dump(int64_t now_us)
         }
         fprintf(stderr, "WhpxExitProfile port 0x%04x count %u\n",
                 best_port, best_count);
+        if (xf) {
+            fprintf(xf, "  port 0x%04x count %u\n", best_port, best_count);
+        }
         whpx_exit_prof.port_counts[best_port] = 0;
     }
     for (int slot = 0; slot < WHPX_EXIT_PROFILE_MMIO_SLOTS; slot++) {
@@ -2417,11 +2436,19 @@ static void whpx_exit_profile_dump(int64_t now_us)
                     " count %" PRIu64 "\n",
                     whpx_exit_prof.mmio_page[slot],
                     whpx_exit_prof.mmio_count[slot]);
+            if (xf) {
+                fprintf(xf, "  mmio page 0x%09" PRIx64 " count %" PRIu64 "\n",
+                        whpx_exit_prof.mmio_page[slot],
+                        whpx_exit_prof.mmio_count[slot]);
+            }
         }
     }
     if (whpx_exit_prof.mmio_overflow) {
         fprintf(stderr, "WhpxExitProfile mmio other count %" PRIu64 "\n",
                 whpx_exit_prof.mmio_overflow);
+    }
+    if (xf) {
+        fclose(xf);
     }
     memset(whpx_exit_prof.port_counts, 0, sizeof(whpx_exit_prof.port_counts));
     memset(whpx_exit_prof.mmio_page, 0, sizeof(whpx_exit_prof.mmio_page));
@@ -2431,6 +2458,8 @@ static void whpx_exit_profile_dump(int64_t now_us)
     whpx_exit_prof.reason_mmio = 0;
     whpx_exit_prof.reason_pio = 0;
     whpx_exit_prof.reason_other = 0;
+    whpx_exit_prof.guest_run_us = 0;
+    whpx_exit_prof.exit_handle_us = 0;
     whpx_exit_prof.window_start_us = now_us;
 }
 
@@ -2579,9 +2608,24 @@ int whpx_vcpu_run(CPUState *cpu)
 
         whpx_inject_exceptions(cpu);
 
+        /* XPD-DIAG: split guest-run time (inside Run) from exit-handling time
+         * (outside Run) to size exits vs guest CPU. Remove per
+         * XPDriver/DIAGNOSTICS-TEMP.md. */
+        int64_t xpd_run_t0 = 0;
+        if (whpx_exit_prof.enabled > 0) {
+            xpd_run_t0 = g_get_monotonic_time();
+            if (whpx_xpd_last_ret_us) {
+                whpx_exit_prof.exit_handle_us +=
+                    xpd_run_t0 - whpx_xpd_last_ret_us;
+            }
+        }
         hr = whp_dispatch.WHvRunVirtualProcessor(
             whpx->partition, cpu->cpu_index,
             &vcpu->exit_ctx, sizeof(vcpu->exit_ctx));
+        if (whpx_exit_prof.enabled > 0) {
+            whpx_xpd_last_ret_us = g_get_monotonic_time();
+            whpx_exit_prof.guest_run_us += whpx_xpd_last_ret_us - xpd_run_t0;
+        }
 
         if (FAILED(hr)) {
             error_report("WHPX: Failed to exec a virtual processor,"

@@ -42,6 +42,13 @@ typedef struct DebugconState {
     MemoryRegion io;
     CharBackend chr;
     uint32_t readback;
+    /* XPD: line-buffer the debug stream. Flushing each guest byte straight to
+     * the chardev is one blocking write syscall per byte, which dominates
+     * exit handling under a debug-logging storm (tens of thousands of bytes
+     * per second -> visible hitches). Accumulate and flush per newline (or
+     * when full) so a storm is a few large writes, not one syscall per byte. */
+    uint8_t tx_buf[512];
+    uint32_t tx_len;
 } DebugconState;
 
 struct ISADebugconState {
@@ -61,9 +68,15 @@ static void debugcon_ioport_write(void *opaque, hwaddr addr, uint64_t val,
     printf(" [debugcon: write addr=0x%04" HWADDR_PRIx " val=0x%02" PRIx64 "]\n", addr, val);
 #endif
 
-    /* XXX this blocks entire thread. Rewrite to use
-     * qemu_chr_fe_write and background I/O callbacks */
-    qemu_chr_fe_write_all(&s->chr, &ch, 1);
+    /* tx_len < sizeof(tx_buf) is invariant (it is reset to 0 on every flush),
+     * so this store is always in bounds. */
+    s->tx_buf[s->tx_len++] = ch;
+    if (ch == '\n' || s->tx_len >= sizeof(s->tx_buf)) {
+        /* XXX still a blocking write, but now once per line (or full buffer)
+         * instead of once per guest byte. */
+        qemu_chr_fe_write_all(&s->chr, s->tx_buf, s->tx_len);
+        s->tx_len = 0;
+    }
 }
 
 
@@ -121,11 +134,24 @@ static Property debugcon_isa_properties[] = {
     DEFINE_PROP_END_OF_LIST(),
 };
 
+static void debugcon_isa_unrealizefn(DeviceState *dev)
+{
+    ISADebugconState *isa = ISA_DEBUGCON_DEVICE(dev);
+    DebugconState *s = &isa->state;
+
+    /* Flush any buffered partial line so the tail of the log isn't lost. */
+    if (s->tx_len) {
+        qemu_chr_fe_write_all(&s->chr, s->tx_buf, s->tx_len);
+        s->tx_len = 0;
+    }
+}
+
 static void debugcon_isa_class_initfn(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = debugcon_isa_realizefn;
+    dc->unrealize = debugcon_isa_unrealizefn;
     device_class_set_props(dc, debugcon_isa_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }

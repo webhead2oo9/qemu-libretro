@@ -205,6 +205,44 @@ static unsigned mesapt_sync_wait_class(hwaddr addr)
     }
 }
 
+/* XPD-DIAG (FPS profiling): RetroArch swallows the core's stderr, so the
+ * SyncWaitProfile DPRINTFs are invisible. Mirror the per-class doorbell wait
+ * to a file when XPD_SYNC_PROFILE is set; called periodically and at context
+ * teardown. Remove per XPDriver/DIAGNOSTICS-TEMP.md. */
+static void mesapt_sync_profile_file_dump(MesaPTState *s, const char *tag)
+{
+    static int enabled = -1;
+    FILE *xf;
+    unsigned cls;
+
+    if (enabled < 0) {
+        const char *env = getenv("XPD_SYNC_PROFILE");
+        enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    if (!enabled) {
+        return;
+    }
+    xf = fopen("C:\\Users\\charlie\\dev\\XPDriver\\host-syncwait-diag.log",
+               "a");
+    if (!xf) {
+        return;
+    }
+    fprintf(xf, "=== SyncWaitProfile %s t_us=%" PRIu64 " ===\n",
+            tag, (uint64_t)g_get_monotonic_time());
+    for (cls = 0; cls < MESAPT_SYNC_WAIT_CLASSES; cls++) {
+        if (!s->sync_wait_calls[cls]) {
+            continue;
+        }
+        fprintf(xf, "  %-10s calls %u total %" PRIu64 " us avg %" PRIu64
+                " us max %" PRIu64 " us ge250ms %u\n",
+                mesapt_sync_wait_names[cls], s->sync_wait_calls[cls],
+                s->sync_wait_us[cls],
+                s->sync_wait_us[cls] / s->sync_wait_calls[cls],
+                s->sync_wait_max_us[cls], s->sync_wait_ge250ms[cls]);
+    }
+    fclose(xf);
+}
+
 static void mesapt_sync_wait_record(MesaPTState *s, unsigned cls, int64_t t0)
 {
     int64_t dt = g_get_monotonic_time() - t0;
@@ -219,6 +257,16 @@ static void mesapt_sync_wait_record(MesaPTState *s, unsigned cls, int64_t t0)
     }
     if (dt >= 250000) {
         s->sync_wait_ge250ms[cls]++;
+    }
+    /* XPD-DIAG: periodic snapshot every ~3s so a non-clean POP exit still
+     * yields data. Remove per XPDriver/DIAGNOSTICS-TEMP.md. */
+    {
+        static int64_t last_dump_us;
+        int64_t now = t0 + dt;
+        if (now - last_dump_us >= 3000000) {
+            last_dump_us = now;
+            mesapt_sync_profile_file_dump(s, "periodic");
+        }
     }
 }
 
@@ -306,6 +354,7 @@ static void mesapt_profile_dump(MesaPTState *s)
                 s->sync_wait_us[cls] / s->sync_wait_calls[cls],
                 s->sync_wait_max_us[cls], s->sync_wait_ge250ms[cls]);
     }
+    mesapt_sync_profile_file_dump(s, "teardown");
 }
 
 static const uint8_t qxpicd_signature[8] = {

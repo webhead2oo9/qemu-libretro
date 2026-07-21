@@ -38,6 +38,12 @@
 #define FX_GL_UNSIGNED_BYTE  0x1401
 #define FX_GL_PACK_ALIGNMENT 0x0D05
 #define FX_GL_BGRA           0x80E1
+/* Backbuffer-select for readback (avoid sampling a bound offscreen FBO). */
+#define FX_GL_BACK                     0x0405
+#define FX_GL_READ_FRAMEBUFFER         0x8CA8
+#define FX_GL_READ_FRAMEBUFFER_BINDING 0x8CAA
+#define FX_GL_FRAMEBUFFER_EXT          0x8D40
+#define FX_GL_FRAMEBUFFER_BINDING_EXT  0x8CA6
 
 /* pixel-buffer-object subset, resolved through wglGetProcAddress */
 #define FX_GL_PIXEL_PACK_BUFFER 0x88EB
@@ -104,6 +110,11 @@ static struct {
     void (WINAPI *glReadPixels)(int, int, int, int, unsigned, unsigned,
                                 void *);
     void (WINAPI *glPixelStorei)(unsigned, int);
+    void (WINAPI *glReadBuffer)(unsigned);
+    void (WINAPI *glGetIntegerv)(unsigned, int *);
+    void (WINAPI *glBindFramebuffer)(unsigned, unsigned);
+    unsigned fbo_read_target;
+    unsigned fbo_read_binding;
     void (WINAPI *glGenBuffers)(int, unsigned *);
     void (WINAPI *glBindBuffer)(unsigned, unsigned);
     void (WINAPI *glBufferData)(unsigned, ptrdiff_t, const void *,
@@ -289,6 +300,9 @@ void qemu_fx_register_sink(const QemuFxSink *sink)
     }
 }
 
+static void *fx_wgl_get_proc(PROC (WINAPI *getproc)(LPCSTR),
+                             const char *name);
+
 static bool fx_gl_resolve(void)
 {
     /* already loaded by mesagl_impl.c or the host glide wrapper; if it
@@ -300,6 +314,31 @@ static bool fx_gl_resolve(void)
     }
     fx.glReadPixels = (void *)GetProcAddress(gl, "glReadPixels");
     fx.glPixelStorei = (void *)GetProcAddress(gl, "glPixelStorei");
+    fx.glReadBuffer = (void *)GetProcAddress(gl, "glReadBuffer");
+    fx.glGetIntegerv = (void *)GetProcAddress(gl, "glGetIntegerv");
+    /* Force the default framebuffer + back buffer as the readback source so a
+     * guest render-to-texture FBO left bound at swap cannot be sampled in
+     * place of the finished frame (the cause of one-frame present flicker).
+     * glBindFramebuffer is an extension entry point resolved through
+     * wglGetProcAddress (a GL context is current here, mid-swap). */
+    {
+        PROC (WINAPI *getproc)(LPCSTR) =
+            (PROC (WINAPI *)(LPCSTR))GetProcAddress(gl, "wglGetProcAddress");
+
+        if (getproc) {
+            fx.glBindFramebuffer =
+                fx_wgl_get_proc(getproc, "glBindFramebuffer");
+            if (fx.glBindFramebuffer) {
+                fx.fbo_read_target = FX_GL_READ_FRAMEBUFFER;
+                fx.fbo_read_binding = FX_GL_READ_FRAMEBUFFER_BINDING;
+            } else {
+                fx.glBindFramebuffer =
+                    fx_wgl_get_proc(getproc, "glBindFramebufferEXT");
+                fx.fbo_read_target = FX_GL_FRAMEBUFFER_EXT;
+                fx.fbo_read_binding = FX_GL_FRAMEBUFFER_BINDING_EXT;
+            }
+        }
+    }
     return fx.glReadPixels && fx.glPixelStorei;
 }
 
@@ -765,6 +804,19 @@ static void fx_swap_readback(bool top_down)
      * the context current on this thread */
     fx.glPixelStorei(FX_GL_PACK_ALIGNMENT, 4);
 
+    /* Read from the window backbuffer, not an offscreen render-to-texture
+     * FBO the guest may have left bound at swap (POP does heavy RTT). Without
+     * this glReadPixels samples that stale target and the published frame
+     * flickers to black. Restored after the readback. */
+    int prev_read_fbo = 0;
+    if (fx.glBindFramebuffer && fx.glGetIntegerv) {
+        fx.glGetIntegerv(fx.fbo_read_binding, &prev_read_fbo);
+        fx.glBindFramebuffer(fx.fbo_read_target, 0);
+    }
+    if (fx.glReadBuffer) {
+        fx.glReadBuffer(FX_GL_BACK);
+    }
+
     /* The fenced three-buffer path maps only transfers the GPU reports
      * complete. Drivers without sync objects retain the old two-PBO
      * fallback. After a size change or resume, the synchronous path below
@@ -791,6 +843,10 @@ static void fx_swap_readback(bool top_down)
         trace_libretro_3dfx_readback("sync-publish", fx.width, fx.height);
         fx.sink->publish(fx.readback, fx.width, fx.height, top_down);
         published = true;
+    }
+
+    if (fx.glBindFramebuffer && fx.glGetIntegerv) {
+        fx.glBindFramebuffer(fx.fbo_read_target, (unsigned)prev_read_fbo);
     }
 
     if (published) {
