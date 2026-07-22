@@ -2385,37 +2385,80 @@ static QemuGamepadState sample_retropad(void)
 }
 
 /* Optional test-harness frame export for core builds without QMP screendump.
- * When XPD_FRAME_RING=1, write at most two frontend frames per second to an
- * atomic eight-slot BMP ring in the process working directory. */
+ * XPD_FRAME_RING=1 enables an atomic BMP ring in the process working
+ * directory. Normal tests default to eight slots and at most two frames per
+ * second; bounded diagnostics may request up to 4096 slots and a shorter
+ * interval through XPD_FRAME_RING_SLOTS and XPD_FRAME_RING_INTERVAL_US. */
+static bool xpd_frame_ring_parse(const char *text, long minimum,
+				 long maximum, long *value)
+{
+	char *end;
+	long parsed;
+
+	if (!text || !text[0] || !value)
+		return false;
+	errno = 0;
+	parsed = strtol(text, &end, 10);
+	if (errno == ERANGE || end == text || *end != '\0' ||
+	    parsed < minimum || parsed > maximum)
+		return false;
+	*value = parsed;
+	return true;
+}
+
+static bool xpd_frame_ring_replace(const char *source,
+				   const char *destination)
+{
+#ifdef _WIN32
+	return MoveFileExA(source, destination,
+			   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+	return rename(source, destination) == 0;
+#endif
+}
+
 static void xpd_frame_ring_dump(const void *buf, int w, int h)
 {
 	static int ring_env = -1;
+	static int ring_slots = 8;
+	static int64_t ring_interval_us = 500000;
 	static int slot;
 	static int64_t last_dump_us;
 	int64_t now_us;
-	char path[32];
+	char path[64];
 	FILE *fp;
 	int y;
 
 	if (ring_env < 0) {
 		const char *v = getenv("XPD_FRAME_RING");
-		ring_env = v && v[0] == '1';
+		const char *slots = getenv("XPD_FRAME_RING_SLOTS");
+		const char *interval = getenv("XPD_FRAME_RING_INTERVAL_US");
+		long parsed;
+
+		ring_env = v && strcmp(v, "1") == 0;
+		if (xpd_frame_ring_parse(slots, 1, 4096, &parsed))
+			ring_slots = (int)parsed;
+		if (xpd_frame_ring_parse(interval, 0, 10000000, &parsed))
+			ring_interval_us = parsed;
 	}
 	if (!ring_env || !buf || w <= 0 || h <= 0)
 		return;
 	now_us = g_get_monotonic_time();
-	if (last_dump_us && now_us - last_dump_us < 500000)
+	if (last_dump_us && now_us - last_dump_us < ring_interval_us)
 		return;
-	last_dump_us = now_us;
 	fp = fopen("frame-ring-tmp.bmp", "wb");
-	if (!fp)
+	if (!fp) {
+		fprintf(stderr, "xpd: frame-ring export disabled after open failure\n");
+		ring_env = 0;
 		return;
+	}
 	{
 		uint32_t row = (uint32_t)w * 4;
 		uint32_t img = row * (uint32_t)h;
 		uint32_t off = 54, ihdr = 40, size = off + img;
 		uint16_t planes = 1, bpp = 32;
 		uint8_t hdr[54] = { 'B', 'M' };
+		bool write_ok;
 
 		memcpy(hdr + 2, &size, 4);
 		memcpy(hdr + 10, &off, 4);
@@ -2425,16 +2468,30 @@ static void xpd_frame_ring_dump(const void *buf, int w, int h)
 		memcpy(hdr + 26, &planes, 2);
 		memcpy(hdr + 28, &bpp, 2);
 		memcpy(hdr + 34, &img, 4);
-		fwrite(hdr, 1, sizeof(hdr), fp);
-		for (y = h - 1; y >= 0; y--)
-			fwrite((const uint8_t *)buf + (size_t)y * row, 1,
-			       row, fp);
+		write_ok = fwrite(hdr, 1, sizeof(hdr), fp) == sizeof(hdr);
+		for (y = h - 1; write_ok && y >= 0; y--)
+			write_ok = fwrite((const uint8_t *)buf + (size_t)y * row,
+					  1, row, fp) == row;
+		if (fclose(fp) != 0)
+			write_ok = false;
+		if (!write_ok) {
+			remove("frame-ring-tmp.bmp");
+			fprintf(stderr,
+				"xpd: frame-ring export disabled after write failure\n");
+			ring_env = 0;
+			return;
+		}
 	}
-	fclose(fp);
 	snprintf(path, sizeof(path), "frame-ring-%d.bmp", slot);
-	slot = (slot + 1) % 8;
-	remove(path);
-	rename("frame-ring-tmp.bmp", path);
+	if (!xpd_frame_ring_replace("frame-ring-tmp.bmp", path)) {
+		remove("frame-ring-tmp.bmp");
+		fprintf(stderr,
+			"xpd: frame-ring export disabled after publish failure\n");
+		ring_env = 0;
+		return;
+	}
+	last_dump_us = now_us;
+	slot = (slot + 1) % ring_slots;
 }
 
 void retro_run(void)
