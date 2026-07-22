@@ -2403,6 +2403,63 @@ static QemuGamepadState sample_retropad(void)
 	return state;
 }
 
+// TEMPORARY DIAGNOSTIC (remove with the host probes): rolling BMP ring of
+// the exact frames handed to the frontend, gated by XPD_FRAME_RING=1.
+// Ground truth for automated visual verdicts (the harness reads the ring
+// because this core build has no QMP screendump). Rate-limited by wall clock
+// to at most two writes/second, but every slower fresh frame is retained; a
+// frame-count divisor misclassified POP's ~1 Hz VGA fallback as frozen.
+// Eight slots, written to the process working directory (qemu/winxp).
+static void xpd_frame_ring_dump(const void *buf, int w, int h)
+{
+	static int ring_env = -1;
+	static int slot;
+	static int64_t last_dump_us;
+	int64_t now_us;
+	char path[32];
+	FILE *fp;
+	int y;
+
+	if (ring_env < 0) {
+		const char *v = getenv("XPD_FRAME_RING");
+		ring_env = v && v[0] == '1';
+	}
+	if (!ring_env || !buf || w <= 0 || h <= 0)
+		return;
+	now_us = g_get_monotonic_time();
+	if (last_dump_us && now_us - last_dump_us < 500000)
+		return;
+	last_dump_us = now_us;
+	fp = fopen("frame-ring-tmp.bmp", "wb");
+	if (!fp)
+		return;
+	{
+		uint32_t row = (uint32_t)w * 4;
+		uint32_t img = row * (uint32_t)h;
+		uint32_t off = 54, ihdr = 40, size = off + img;
+		uint16_t planes = 1, bpp = 32;
+		uint8_t hdr[54] = { 'B', 'M' };
+
+		memcpy(hdr + 2, &size, 4);
+		memcpy(hdr + 10, &off, 4);
+		memcpy(hdr + 14, &ihdr, 4);
+		memcpy(hdr + 18, &w, 4);
+		memcpy(hdr + 22, &h, 4);
+		memcpy(hdr + 26, &planes, 2);
+		memcpy(hdr + 28, &bpp, 2);
+		memcpy(hdr + 34, &img, 4);
+		fwrite(hdr, 1, sizeof(hdr), fp);
+		for (y = h - 1; y >= 0; y--)
+			fwrite((const uint8_t *)buf + (size_t)y * row, 1,
+			       row, fp);
+	}
+	fclose(fp);
+	snprintf(path, sizeof(path), "frame-ring-%d.bmp", slot);
+	slot = (slot + 1) % 8;
+	remove(path);
+	rename("frame-ring-tmp.bmp", path);
+}
+
 void retro_run(void)
 {
 #ifdef CONFIG_QEMU_3DFX
@@ -2547,6 +2604,9 @@ void retro_run(void)
 	// upload/vsync.
 	frame_finish_acquire(fresh);
 	if (present_valid) {
+		if (fresh)
+			xpd_frame_ring_dump(present_frame.buf,
+					    present_frame.w, present_frame.h);
 		cb_video_refresh(fresh ? present_frame.buf : NULL,
 				 present_frame.w, present_frame.h,
 				 (size_t)present_frame.w * 4);

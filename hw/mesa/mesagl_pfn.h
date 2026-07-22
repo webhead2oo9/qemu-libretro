@@ -48,6 +48,7 @@ typedef void (APIENTRYP PFNGLDELETETEXTURESPROC) (GLsizei n, const GLuint *textu
 typedef void (APIENTRYP PFNGLDISABLEPROC) (GLenum cap);
 typedef void (APIENTRYP PFNGLDRAWARRAYSPROC) (GLenum mode, GLint first, GLsizei count);
 typedef void (APIENTRYP PFNGLENABLEPROC) (GLenum cap);
+typedef void (APIENTRYP PFNGLGETFLOATVPROC) (GLenum pname, GLfloat *params);
 typedef void (APIENTRYP PFNGLENDLISTPROC) (void);
 typedef void (APIENTRYP PFNGLGENTEXTURESPROC) (GLsizei n, GLuint *textures);
 typedef void (APIENTRYP PFNGLGETINTEGERVPROC) (GLenum pname, GLint *data);
