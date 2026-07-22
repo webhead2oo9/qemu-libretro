@@ -78,10 +78,5 @@ void MesaContextAttest(const char *, int *);
 void MesaBlitFree(void);
 int MesaBlitScale(void);
 void MesaRenderScaler(const uint32_t, void *);
-void MesaSurfaceCopyProbe(const uint32_t *);
-void MesaDrawStateProbe(int, int);
-void MesaAlphaKillProbe(unsigned int);
-void MesaFboEventProbe(int, const uint32_t *);
-void MesaReadbackOriginProbe(int *, int *);
 
 #endif //MESAGL_IMPL_H

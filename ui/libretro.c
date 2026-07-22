@@ -227,22 +227,6 @@ static int64_t fx_last_publish_us;	/* monotonic time of the last 3D publish */
  * genuine mode-change resets it so 2D reclaims the screen immediately. */
 #define FX_2D_RECLAIM_US ((int64_t)4 * 1000000)
 
-/* TEMP flicker-diag: count 2D(VGA) vs 3D(fx) publishes and log fx_active
- * toggles to a fixed file. Remove once the flicker is fixed. */
-static unsigned long g_diag_vga_pub, g_diag_fx_pub;
-static void fx_diag_toggle_log(int on)
-{
-	static FILE *f;
-	if (!f) {
-		f = fopen("C:\\Users\\charlie\\dev\\XPDriver\\host-fxactive-diag.log", "w");
-		if (!f) {
-			return;
-		}
-	}
-	fprintf(f, "fx_active=%d vga_pub=%lu fx_pub=%lu t_us=%lld\n", on,
-		g_diag_vga_pub, g_diag_fx_pub, (long long)g_get_monotonic_time());
-	fflush(f);
-}
 #ifdef CONFIG_QEMU_3DFX
 /* retro_run heartbeat: incremented by the frontend thread and sampled by
  * the 3D readback thread so capture can stop while the frontend is idle. */
@@ -1008,7 +992,6 @@ static void refresh(DisplayChangeListener *dcl)
 		}
 		pending_frame.bottom_up = false;
 		pending_updated = true;
-		g_diag_vga_pub++;
 		pthread_mutex_unlock(&frame_mutex);
 	}
 }
@@ -1043,7 +1026,6 @@ static void fx_sink_publish(const void *pixels, int w, int h,
 	pending_ensure(w, h);
 	memcpy(pending_frame.buf, pixels, (size_t)w * h * 4);
 	pending_frame.bottom_up = !top_down;
-	g_diag_fx_pub++;
 	fx_last_publish_us = g_get_monotonic_time();
 	pthread_mutex_unlock(&frame_mutex);
 
@@ -1077,7 +1059,6 @@ static void fx_sink_publish(const void *pixels, int w, int h,
 static void fx_sink_set_active(bool on)
 {
 	fx_active = on;
-	fx_diag_toggle_log(on);
 	// returning to 2D: force one publish even if the console reports
 	// no fresh damage
 	if (!on) {
@@ -2403,13 +2384,9 @@ static QemuGamepadState sample_retropad(void)
 	return state;
 }
 
-// TEMPORARY DIAGNOSTIC (remove with the host probes): rolling BMP ring of
-// the exact frames handed to the frontend, gated by XPD_FRAME_RING=1.
-// Ground truth for automated visual verdicts (the harness reads the ring
-// because this core build has no QMP screendump). Rate-limited by wall clock
-// to at most two writes/second, but every slower fresh frame is retained; a
-// frame-count divisor misclassified POP's ~1 Hz VGA fallback as frozen.
-// Eight slots, written to the process working directory (qemu/winxp).
+/* Optional test-harness frame export for core builds without QMP screendump.
+ * When XPD_FRAME_RING=1, write at most two frontend frames per second to an
+ * atomic eight-slot BMP ring in the process working directory. */
 static void xpd_frame_ring_dump(const void *buf, int w, int h)
 {
 	static int ring_env = -1;

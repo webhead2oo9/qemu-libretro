@@ -36,17 +36,6 @@
 #define MESAPT_PROFILE_FENUM_MAX 0x800
 #define MESAPT_PROFILE_TOP 8
 
-/* Queue-inclusive synchronous doorbell wait classes (SyncWaitProfile). */
-enum {
-    MESAPT_SYNC_WAIT_HEARTBEAT = 0,  /* 0xFB0 */
-    MESAPT_SYNC_WAIT_SWAP,           /* 0xFF0 */
-    MESAPT_SYNC_WAIT_PUBLISH,        /* 0xFD4 */
-    MESAPT_SYNC_WAIT_DIRECT,         /* 0xFC0, incl. declined async fallback */
-    MESAPT_SYNC_WAIT_ASYNC_DRAW,     /* 0xFB8 accepted (reserve backpressure) */
-    MESAPT_SYNC_WAIT_OTHER,
-    MESAPT_SYNC_WAIT_CLASSES,
-};
-
 #ifdef DEBUG_MESAPT
 #define DPRINTF(fmt, ...) \
     do { fprintf(stderr, "mesapt: " fmt "\n" , ## __VA_ARGS__); } while(0)
@@ -145,15 +134,6 @@ struct MesaPTState
     uint32_t profile_publish_calls;
     uint32_t profile_swap_calls;
 
-    /* Queue-inclusive sync doorbell wait (vCPU side): measured from
-     * mesapt_write entry to main-thread completion, so the BH queue wait
-     * before mesapt_write_main runs — invisible to the in-handler timers
-     * above — is included. */
-    uint64_t sync_wait_us[MESAPT_SYNC_WAIT_CLASSES];
-    uint64_t sync_wait_max_us[MESAPT_SYNC_WAIT_CLASSES];
-    uint32_t sync_wait_calls[MESAPT_SYNC_WAIT_CLASSES];
-    uint32_t sync_wait_ge250ms[MESAPT_SYNC_WAIT_CLASSES];
-
     /* Explicit single-owner session state. Numeric values are part of the
      * MESA_PROBE response, so keep FREE/RESERVED/OWNED at 0/1/2. */
     enum {
@@ -189,87 +169,6 @@ struct MesaPTState
 
 };
 
-static const char *const mesapt_sync_wait_names[MESAPT_SYNC_WAIT_CLASSES] = {
-    "heartbeat(0xFB0)", "swap(0xFF0)", "publish(0xFD4)", "direct(0xFC0)",
-    "async-draw(0xFB8)", "other",
-};
-
-static unsigned mesapt_sync_wait_class(hwaddr addr)
-{
-    switch (addr) {
-    case 0xFB0: return MESAPT_SYNC_WAIT_HEARTBEAT;
-    case 0xFF0: return MESAPT_SYNC_WAIT_SWAP;
-    case 0xFD4: return MESAPT_SYNC_WAIT_PUBLISH;
-    case 0xFC0: return MESAPT_SYNC_WAIT_DIRECT;
-    default:    return MESAPT_SYNC_WAIT_OTHER;
-    }
-}
-
-/* XPD-DIAG (FPS profiling): RetroArch swallows the core's stderr, so the
- * SyncWaitProfile DPRINTFs are invisible. Mirror the per-class doorbell wait
- * to a file when XPD_SYNC_PROFILE is set; called periodically and at context
- * teardown. Remove per XPDriver/DIAGNOSTICS-TEMP.md. */
-static void mesapt_sync_profile_file_dump(MesaPTState *s, const char *tag)
-{
-    static int enabled = -1;
-    FILE *xf;
-    unsigned cls;
-
-    if (enabled < 0) {
-        const char *env = getenv("XPD_SYNC_PROFILE");
-        enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
-    }
-    if (!enabled) {
-        return;
-    }
-    xf = fopen("C:\\Users\\charlie\\dev\\XPDriver\\host-syncwait-diag.log",
-               "a");
-    if (!xf) {
-        return;
-    }
-    fprintf(xf, "=== SyncWaitProfile %s t_us=%" PRIu64 " ===\n",
-            tag, (uint64_t)g_get_monotonic_time());
-    for (cls = 0; cls < MESAPT_SYNC_WAIT_CLASSES; cls++) {
-        if (!s->sync_wait_calls[cls]) {
-            continue;
-        }
-        fprintf(xf, "  %-10s calls %u total %" PRIu64 " us avg %" PRIu64
-                " us max %" PRIu64 " us ge250ms %u\n",
-                mesapt_sync_wait_names[cls], s->sync_wait_calls[cls],
-                s->sync_wait_us[cls],
-                s->sync_wait_us[cls] / s->sync_wait_calls[cls],
-                s->sync_wait_max_us[cls], s->sync_wait_ge250ms[cls]);
-    }
-    fclose(xf);
-}
-
-static void mesapt_sync_wait_record(MesaPTState *s, unsigned cls, int64_t t0)
-{
-    int64_t dt = g_get_monotonic_time() - t0;
-
-    if (dt < 0) {
-        dt = 0;
-    }
-    s->sync_wait_us[cls] += (uint64_t)dt;
-    s->sync_wait_calls[cls]++;
-    if ((uint64_t)dt > s->sync_wait_max_us[cls]) {
-        s->sync_wait_max_us[cls] = (uint64_t)dt;
-    }
-    if (dt >= 250000) {
-        s->sync_wait_ge250ms[cls]++;
-    }
-    /* XPD-DIAG: periodic snapshot every ~3s so a non-clean POP exit still
-     * yields data. Remove per XPDriver/DIAGNOSTICS-TEMP.md. */
-    {
-        static int64_t last_dump_us;
-        int64_t now = t0 + dt;
-        if (now - last_dump_us >= 3000000) {
-            last_dump_us = now;
-            mesapt_sync_profile_file_dump(s, "periodic");
-        }
-    }
-}
-
 static void mesapt_profile_reset(MesaPTState *s)
 {
     memset(s->profile_direct_us, 0, sizeof(s->profile_direct_us));
@@ -278,10 +177,6 @@ static void mesapt_profile_reset(MesaPTState *s)
     s->profile_swap_us = 0;
     s->profile_publish_calls = 0;
     s->profile_swap_calls = 0;
-    memset(s->sync_wait_us, 0, sizeof(s->sync_wait_us));
-    memset(s->sync_wait_max_us, 0, sizeof(s->sync_wait_max_us));
-    memset(s->sync_wait_calls, 0, sizeof(s->sync_wait_calls));
-    memset(s->sync_wait_ge250ms, 0, sizeof(s->sync_wait_ge250ms));
 }
 
 static void mesapt_profile_dump(MesaPTState *s)
@@ -343,18 +238,6 @@ static void mesapt_profile_dump(MesaPTState *s)
                 s->profile_direct_us[best] /
                     s->profile_direct_calls[best]);
     }
-    for (unsigned int cls = 0; cls < MESAPT_SYNC_WAIT_CLASSES; cls++) {
-        if (!s->sync_wait_calls[cls]) {
-            continue;
-        }
-        DPRINTF("SyncWaitProfile %s calls %u total %" PRIu64
-                " us avg %" PRIu64 " us max %" PRIu64 " us ge250ms %u",
-                mesapt_sync_wait_names[cls], s->sync_wait_calls[cls],
-                s->sync_wait_us[cls],
-                s->sync_wait_us[cls] / s->sync_wait_calls[cls],
-                s->sync_wait_max_us[cls], s->sync_wait_ge250ms[cls]);
-    }
-    mesapt_sync_profile_file_dump(s, "teardown");
 }
 
 static const uint8_t qxpicd_signature[8] = {
@@ -2400,71 +2283,6 @@ static void processArgs(MesaPTState *s)
     }
 }
 
-/* XPD-DIAG: dump D3D surface-readback payloads (glReadPixels into the FBT
- * bounce) as BMPs, so the exact bytes handed back to the guest CPU are
- * inspectable. A rolling ring of 16 slots keeps the MOST RECENT readbacks
- * (the game idles at the menu when the session ends, so the ring holds the
- * menu-era payloads even after cutscene-era readbacks). An index log maps
- * sequence -> slot/dimensions. Rows are written assuming FBT row 0 is the
- * image top; if the resulting BMP appears vertically flipped, the readback
- * orientation claim is wrong, which is itself evidence. */
-static void xpd_dump_readback_bmp(const uint8_t *pix, int w, int h)
-{
-    static int xpd_readback_seq;
-    unsigned char fh[14], ih[40];
-    char path[128];
-    int row = w * 3;
-    int imgsize = row * h;
-    int filesize = 54 + imgsize;
-    int slot = xpd_readback_seq % 16;
-    int x, y;
-    FILE *fp;
-
-    if (xpd_readback_seq < 4096) {
-        int origin_fb = 0, origin_att = 0;
-        MesaReadbackOriginProbe(&origin_fb, &origin_att);
-        fp = fopen("C:\\Users\\charlie\\dev\\XPDriver\\qemu\\winxp\\"
-                   "host-readback-index.log", "a");
-        if (fp) {
-            fprintf(fp,
-                    "seq=%d slot=%02d w=%d h=%d read_fb=%d attach=%d\n",
-                    xpd_readback_seq, slot, w, h, origin_fb, origin_att);
-            fclose(fp);
-        }
-    }
-    snprintf(path, sizeof(path),
-             "C:\\Users\\charlie\\dev\\XPDriver\\qemu\\winxp\\"
-             "host-readback-%02d.bmp", slot);
-    xpd_readback_seq++;
-    memset(fh, 0, sizeof(fh));
-    memset(ih, 0, sizeof(ih));
-    fh[0] = 'B'; fh[1] = 'M';
-    fh[2] = filesize & 0xff; fh[3] = (filesize >> 8) & 0xff;
-    fh[4] = (filesize >> 16) & 0xff; fh[5] = (filesize >> 24) & 0xff;
-    fh[10] = 54;
-    ih[0] = 40;
-    ih[4] = w & 0xff; ih[5] = (w >> 8) & 0xff;
-    ih[6] = (w >> 16) & 0xff; ih[7] = (w >> 24) & 0xff;
-    ih[8] = h & 0xff; ih[9] = (h >> 8) & 0xff;
-    ih[10] = (h >> 16) & 0xff; ih[11] = (h >> 24) & 0xff;
-    ih[12] = 1;
-    ih[14] = 24;
-    ih[20] = imgsize & 0xff; ih[21] = (imgsize >> 8) & 0xff;
-    ih[22] = (imgsize >> 16) & 0xff; ih[23] = (imgsize >> 24) & 0xff;
-    fp = fopen(path, "wb");
-    if (fp) {
-        fwrite(fh, 1, 14, fp);
-        fwrite(ih, 1, 40, fp);
-        /* BMP rows are bottom-up; FBT rows are top-down BGRA. */
-        for (y = h - 1; y >= 0; y--) {
-            const uint8_t *src = pix + (size_t)y * w * 4;
-            for (x = 0; x < w; x++)
-                fwrite(src + x * 4, 1, 3, fp);
-        }
-        fclose(fp);
-    }
-}
-
 static void processFRet(MesaPTState *s)
 {
     uint8_t *outshm = s->rgn_out;
@@ -2477,16 +2295,6 @@ static void processFRet(MesaPTState *s)
     }
 
     switch (s->FEnum) {
-        case FEnum_glReadPixels:
-            /* XPD-DIAG: see xpd_dump_readback_bmp. */
-            if (s->pixPackBuf == 0 && s->arg[4] == 0x80E1 &&
-                s->arg[5] == GL_UNSIGNED_BYTE &&
-                s->arg[2] >= 16 && s->arg[2] <= 1024 &&
-                s->arg[3] >= 16 && s->arg[3] <= 1024) {
-                xpd_dump_readback_bmp((const uint8_t *)s->fbtm_ptr,
-                                      (int)s->arg[2], (int)s->arg[3]);
-            }
-            break;
         case FEnum_glBindBuffer:
         case FEnum_glBindBufferARB:
             s->pixPackBuf = (s->arg[0] == GL_PIXEL_PACK_BUFFER)? s->arg[1]:s->pixPackBuf;
@@ -2549,8 +2357,6 @@ static void processFRet(MesaPTState *s)
             break;
         case FEnum_glEnable:
         case FEnum_glEnableClientState:
-            if (s->FEnum == FEnum_glEnable)
-                MesaAlphaKillProbe(s->arg[0]);
             if (GLFuncTrace() && ((GLFuncTrace() == 2) ||
                 ((s->logpname[s->arg[0] >> 3] & (1 << (s->arg[0] % 8))) == 0))) {
                 s->logpname[s->arg[0] >> 3] |= (1 << (s->arg[0] % 8));
@@ -2569,37 +2375,6 @@ static void processFRet(MesaPTState *s)
         case FEnum_glFlush:
             MGLActivateHandler(1, 0);
             dispTimerSched(s->dispTimer, &s->crashRC);
-            break;
-        case FEnum_glBlitFramebuffer:
-        case FEnum_glBlitFramebufferEXT:
-            MesaSurfaceCopyProbe(s->arg);
-            break;
-        case FEnum_glDrawArrays:
-        case FEnum_glDrawArraysEXT:
-            MesaDrawStateProbe(s->arg[0], s->arg[2]);
-            break;
-        case FEnum_glFramebufferTexture2D:
-        case FEnum_glFramebufferTexture2DEXT:
-            MesaFboEventProbe(0, s->arg);
-            break;
-        case FEnum_glBindFramebuffer:
-        case FEnum_glBindFramebufferEXT:
-            MesaFboEventProbe(1, s->arg);
-            break;
-        case FEnum_glDeleteTextures:
-        case FEnum_glDeleteTexturesEXT:
-            MesaFboEventProbe(2, s->arg);
-            break;
-        case FEnum_glClear:
-            MesaFboEventProbe(3, s->arg);
-            break;
-        case FEnum_glDrawElements:
-        case FEnum_glDrawElementsBaseVertex:
-            MesaDrawStateProbe(s->arg[0], s->arg[1]);
-            break;
-        case FEnum_glDrawRangeElements:
-        case FEnum_glDrawRangeElementsEXT:
-            MesaDrawStateProbe(s->arg[0], s->arg[3]);
             break;
         case FEnum_glMapBuffer:
         case FEnum_glMapBufferARB:
@@ -3257,28 +3032,6 @@ static void mesapt_write_main(void *opaque)
         }
     }
     else if (val == MESAGL_MAGIC) {
-        /* XPD-DIAG: prove what state each wgl doorbell arrives in and whether
-         * the legacy fifo still holds unexecuted commands (a present submits
-         * bind+blit+restore there before ringing swap/publish). Bounded. */
-        if (addr == 0xFF0 || addr == 0xFD4) {
-            static int xpd_swap_logs;
-            if (xpd_swap_logs < 240) {
-                uint32_t *fifoptr = (uint32_t *)s->fifo_ptr;
-                FILE *xfp = fopen(
-                    "C:\\Users\\charlie\\dev\\XPDriver\\qemu\\winxp\\"
-                    "host-frame-trace.log", "a");
-                xpd_swap_logs++;
-                if (xfp) {
-                    fprintf(xfp,
-                        "DOORBELL addr=%03x cntx=%d curr=%d tokened=%d "
-                        "fifo_depth=%u\n",
-                        (unsigned)addr, s->mglContext, s->mglCntxCurrent,
-                        s->owner_tokened ? 1 : 0,
-                        fifoptr ? fifoptr[0] : 0);
-                    fclose(xfp);
-                }
-            }
-        }
         if (s->mglContext && s->mglCntxCurrent) {
             processFifo(s);
             do {
@@ -3677,13 +3430,11 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     MesaPTState *s = opaque;
     MesaPTWriteRequest request;
-    int64_t sync_wait_t0 = g_get_monotonic_time();
 
     /* Asynchronous draw doorbell: snapshot + post on this vCPU thread without
      * waiting on GL. If it declines (no owner/context/dispatch, or malformed),
      * fall through and process it synchronously exactly as the 0xFC0 doorbell. */
     if (addr == MESAPT_ASYNC_DRAW_DOORBELL && mesapt_try_async_draw(s)) {
-        mesapt_sync_wait_record(s, MESAPT_SYNC_WAIT_ASYNC_DRAW, sync_wait_t0);
         return;
     }
 
@@ -3696,8 +3447,6 @@ static void mesapt_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     };
 
     qemu_fx_run_on_main_thread(mesapt_write_main, &request);
-    mesapt_sync_wait_record(s, mesapt_sync_wait_class(request.addr),
-                            sync_wait_t0);
 }
 
 static const MemoryRegionOps mesapt_ops = {
