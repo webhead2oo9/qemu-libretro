@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Embedding API of the QD3D host executor, used by the loopback harness
- * (qd3d/host/loopback) and the qemu-libretro device. Every function must be
- * called on the same thread: the executor owns Direct3D 9Ex objects and a
- * hidden window that belong to that thread.
+ * (qd3d/host/loopback) and the qemu-libretro device. Except for
+ * qd3dx_request_release, every function must be called on the same thread:
+ * the executor owns Direct3D 9Ex objects and a window of that thread.
  *
  * Embedder loop:
  *
@@ -68,12 +68,12 @@ struct qd3dx_hooks {
     /* Called on the executor thread when the source of the last frame this
      * executor published is gone: its device, or the additional swap chain
      * it was presented through, was released (by the guest, or because its
-     * session ended: GOODBYE, the next HELLO on the channel, qd3dx_reset).
-     * Every frame presented before the release has reached the frame hook
-     * by then (a new session and qd3dx_reset drop the frame still in
-     * flight instead), so the embedder can stop showing frames at once.
-     * The implicit swap chain ends only with its device. Not called by
-     * qd3dx_destroy. May be NULL. */
+     * session ended: GOODBYE, the next HELLO on the channel, qd3dx_reset,
+     * qd3dx_request_release). Every frame presented before an ordinary
+     * release has reached the frame hook by then; a new session, reset or
+     * requested release drops the frame still in flight instead. The
+     * embedder can stop showing frames at once. The implicit swap chain ends
+     * only with its device. Not called by qd3dx_destroy. May be NULL. */
     void (*source_released)(void *user);
     /* Called on the executor thread when the window of the source of the
      * last frame this executor published was minimized, or hidden after it
@@ -94,17 +94,18 @@ struct qd3dx_hooks {
 struct qd3dx *qd3dx_create(void *base, uint32_t size, const struct qd3dx_hooks *hooks);
 
 /*
- * Executes at most budget commands. Returns the number executed (0 when the
- * ring is empty), or -1 when the session is faulted: host_state is then
- * QD3D_HOST_FAULT and nothing more executes until qd3dx_reset.
+ * Executes at most budget commands, servicing requested releases before
+ * commands and before returning (even with budget 0). Returns the number
+ * executed (0 when the ring is empty), or -1 when the session is faulted:
+ * host_state is QD3D_HOST_FAULT until reset or a requested release.
  */
 int qd3dx_poll(struct qd3dx *ex, uint32_t budget);
 
 /*
- * Publishes the frame still in flight, if any (waiting for its readback),
- * then host_idle = 1, and re-checks the ring. Returns 1 (and clears
- * host_idle) if work arrived, in which case the caller must not wait; 0 if
- * the caller may wait for a doorbell.
+ * Services requested releases, publishes the frame still in flight if any
+ * (waiting for its readback), then host_idle = 1, and re-checks the ring
+ * and release request. Returns 1 (and clears host_idle) if work arrived,
+ * in which case the caller must not wait; 0 if it may wait for a doorbell.
  */
 int qd3dx_prepare_wait(struct qd3dx *ex);
 
@@ -113,11 +114,41 @@ void qd3dx_wake(struct qd3dx *ex);
 
 /*
  * Releases every object of the current session and returns the channel to
- * QD3D_HOST_READY with an empty ring, for example after a fault or when the
- * embedder learns that the guest process is gone. A frame still in flight
- * is dropped, not published.
+ * QD3D_HOST_READY, discarding queued packets, for example after a fault or
+ * system reset. A frame still in flight is dropped, not published. A
+ * pending ownership release takes precedence, preserving packets of its
+ * successor (fault recovery may race a new claim). For ownership handoff
+ * always use qd3dx_request_release.
  */
 void qd3dx_reset(struct qd3dx *ex);
+
+/*
+ * The sole cross-thread API: atomically requests the current slot owner's
+ * release, without calling Direct3D or any hook, waiting for the executor,
+ * or changing the shared channel. The caller must keep ex alive, serialize
+ * release notifications in ownership order, and kick the executor after
+ * the call. Before it, the old producer must be unmapped/quiescent; only
+ * after it returns may the slot be claimed again.
+ *
+ * Captures the current ring head. poll/prepare_wait on the executor thread
+ * drop the abandoned frame, release all session objects, notify
+ * source_released if applicable, clear fault/liveness state and discard
+ * packets through that captured head, including any stale queued HELLO.
+ * Native work or a hook already begun can finish before teardown.
+ * The next owner appends (never resets cursors), starting with a synchronous
+ * HELLO: its packets after the captured head survive. It cannot submit
+ * frames until HELLO replies, so release can retire the old frame count.
+ * Pending requests coalesce to the latest boundary; repeated releases of
+ * an unchanged owner/idle slot are harmless.
+ *
+ * The VM's QD3D_VM_REG_RELEASE handler calls this then signals its kick.
+ * Loopback provides manual-reset NAME_RELEASE_<i> events, including slot
+ * 0: quiesce the producer, SetEvent, then wait until the event is reset
+ * before closing its claim or appending a new owner's HELLO. The harness
+ * resets it only after this call captured the boundary (not necessarily
+ * after D3D teardown); the event also wakes its executor loop.
+ */
+void qd3dx_request_release(struct qd3dx *ex);
 
 /*
  * 1 when the guest showed signs of life since the last call: a command

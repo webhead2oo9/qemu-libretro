@@ -3,16 +3,19 @@
  *
  * A replacement d3d9.dll in the Windows XP guest serialises Direct3D 9 calls
  * into a channel (XPDriver qd3d/proto/qd3d_proto.h). This device exposes
- * QD3D_VM_SLOTS channels, one per Direct3D process (the guest claims a slot
- * per process), as guest-physical RAM from QD3D_VM_CHANNEL_GPA plus a
- * register page at QD3D_VM_MMIO_GPA, and runs one XPDriver executor per
- * slot (hw/qd3d/host, a synced copy, see scripts/qd3d-sync.sh), all on one
- * thread of its own. The executors replay the calls on Direct3D 9Ex;
+ * QD3D_VM_SLOTS channels, one per Direct3D process (qxpmap.sys owns the
+ * slot claims and notifies releases), as guest-physical RAM from
+ * QD3D_VM_CHANNEL_GPA plus a register page at QD3D_VM_MMIO_GPA, and runs
+ * one XPDriver executor per slot (hw/qd3d/host, a synced copy, see
+ * scripts/qd3d-sync.sh), all on one thread of its own. The executors replay
+ * the calls on Direct3D 9Ex;
  * presented frames of every slot go to the libretro frontend through the
  * qemu-3dfx frame sink.
  *
- * The guest writes the ring directly into RAM (no VM exit); only the
- * doorbell write exits, and only when the executor reported itself idle.
+ * The guest writes the ring directly into RAM (no VM exit); the doorbell
+ * exits only when the executor reported itself idle. A kernel RELEASE
+ * write captures the old owner's ring boundary and kicks that same thread;
+ * all Direct3D teardown remains on the executor thread.
  *
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -38,13 +41,14 @@ QEMU_BUILD_BUG_ON((uint64_t)QD3D_VM_CHANNEL_GPA +
                   (uint64_t)QD3D_VM_SLOTS * QD3D_VM_CHANNEL_SIZE >
                   QD3D_VM_MMIO_GPA);
 QEMU_BUILD_BUG_ON(QD3D_VM_REG_SLOTS >= QD3D_VM_MMIO_SIZE);
+QEMU_BUILD_BUG_ON(QD3D_VM_REG_RELEASE >= QD3D_VM_MMIO_SIZE);
 
 /* What the frontend shows follows the executors' display policy (qd3dx.h):
  * 3D output ends as soon as the device or swap chain whose frames are shown
  * is released or its window minimized or hidden (source_released,
- * source_hidden; GOODBYE and a slot reset release it too), and when the
- * slot shown gives no sign of life for QD3DX_DISPLAY_IDLE_US: its process
- * died without GOODBYE. A live guest beats its heartbeat however static
+ * source_hidden; GOODBYE, a kernel slot release and a slot reset release
+ * it too), and when the slot shown gives no sign of life for
+ * QD3DX_DISPLAY_IDLE_US. A live guest beats its heartbeat however static
  * its screen, so menus that redraw only on change stay up, and a slot that
  * lives again after such silence (a paused VM resumed) shows its frame. */
 
@@ -58,7 +62,7 @@ QEMU_BUILD_BUG_ON(QD3D_VM_REG_SLOTS >= QD3D_VM_MMIO_SIZE);
 
 OBJECT_DECLARE_SIMPLE_TYPE(QD3DPTState, QD3DPT)
 
-/* One channel slot; executor thread only. */
+/* One channel slot. Only ex's atomic release mailbox is used off-thread. */
 typedef struct QD3DPTSlot {
     QD3DPTState *s;
     unsigned index;
@@ -80,6 +84,7 @@ struct QD3DPTState {
     int stop;             /* atomic: thread exit request */
     int reset_req;        /* atomic: system reset request */
     int slots;            /* atomic: slots served (QD3D_VM_REG_SLOTS) */
+    int bad_release_logged; /* atomic: report an invalid slot only once */
 
     /* executor thread only */
     QD3DPTSlot slot[QD3D_VM_SLOTS];
@@ -236,6 +241,8 @@ static void qd3dpt_watch(QD3DPTState *s, int64_t now)
                 qd3dx_reset(sl->ex);
                 sl->fault_since = 0;
             }
+        } else {
+            sl->fault_since = 0;
         }
     }
     if (qd3dx_display_idle(&s->disp, (uint64_t)now)) {
@@ -277,7 +284,7 @@ static void *qd3dpt_thread(void *opaque)
         }
     }
     qd3dx_display_init(&s->disp);
-    qatomic_set(&s->slots, QD3D_VM_SLOTS);
+    qatomic_store_release(&s->slots, QD3D_VM_SLOTS);
 
     while (!qatomic_read(&s->stop)) {
         bool work = false, idle = false, busy = false;
@@ -332,6 +339,7 @@ static void *qd3dpt_thread(void *opaque)
         }
     }
 
+    qatomic_store_release(&s->slots, 0);
     for (i = 0; i < QD3D_VM_SLOTS; i++) {
         qd3dx_destroy(s->slot[i].ex);
         s->slot[i].ex = NULL;
@@ -360,8 +368,29 @@ static void qd3dpt_write(void *opaque, hwaddr addr, uint64_t val,
 {
     QD3DPTState *s = opaque;
 
-    if (addr == QD3D_VM_REG_KICK) {
+    switch (addr) {
+    case QD3D_VM_REG_KICK:
         SetEvent(s->kick);
+        break;
+    case QD3D_VM_REG_RELEASE:
+        if (val >= QD3D_VM_SLOTS) {
+            if (!qatomic_xchg(&s->bad_release_logged, 1)) {
+                warn_report("qd3d: ignoring out-of-range release slot %" PRIu64,
+                            val);
+            }
+            break;
+        }
+        if (val < (uint64_t)qatomic_load_acquire(&s->slots)) {
+            /* The driver quiesced the old producer before this write and
+             * frees ownership only after it returns. Capture head now,
+             * not when the executor eventually sees the kick: by then a
+             * new owner may have appended its synchronous HELLO. */
+            qd3dx_request_release(s->slot[val].ex);
+            SetEvent(s->kick);
+        }
+        break;
+    default:
+        break;
     }
 }
 

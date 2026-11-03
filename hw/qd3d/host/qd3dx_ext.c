@@ -587,7 +587,7 @@ static void qd3dx_republish(struct qd3dx *ex, uint32_t repeat)
     struct qd3dx_frame f;
     int32_t x = 0, y = 0;
 
-    if (!d || d->front < 0 || ex->shown_hidden || !ex->hooks.frame)
+    if (!d || d->front < 0 || ex->shown_hidden || !ex->hooks.frame || ex->release_request)
         return;
     f.width = d->copy_w[d->front];
     f.height = d->copy_h[d->front];
@@ -604,7 +604,8 @@ static void qd3dx_republish(struct qd3dx *ex, uint32_t repeat)
     f.pitch = (uint32_t)lr.Pitch;
     if (cur)
         qd3dx_cursor_apply(&f, cur, x, y, ex->cursor_save, 0);
-    ex->hooks.frame(ex->hooks.user, &f);
+    if (!ex->release_request)
+        ex->hooks.frame(ex->hooks.user, &f);
     if (cur)
         qd3dx_cursor_apply(&f, cur, x, y, ex->cursor_save, 1);
     s->lpVtbl->UnlockRect(s);
@@ -788,6 +789,10 @@ void qd3dx_present_flush(struct qd3dx *ex)
     HRESULT hr;
     int i;
 
+    if (ex->release_request) {
+        qd3dx_present_drop(ex);
+        return;
+    }
     if (!d) {
         /* Nothing in flight: a pending cursor update shows the last frame
          * again once due. */
@@ -818,22 +823,26 @@ void qd3dx_present_flush(struct qd3dx *ex)
             ex->trace_lat_max = lat;
     }
     if (SUCCEEDED(hr)) {
-        d->front = i;
-        memcpy(d->front_screen, ex->inflight_screen, sizeof d->front_screen);
-        ex->shown_dev = d;
-        ex->shown_sc = ex->inflight_sc;
-        ex->shown_hidden = 0;
-        if (ex->hooks.frame) {
-            f.pixels = lr.pBits;
-            f.width = d->copy_w[i];
-            f.height = d->copy_h[i];
-            f.pitch = (uint32_t)lr.Pitch;
-            f.repeat = QD3DX_REPEAT_NONE;
-            if (cur)
-                qd3dx_cursor_apply(&f, cur, ex->inflight_cx, ex->inflight_cy, ex->cursor_save, 0);
-            ex->hooks.frame(ex->hooks.user, &f);
-            if (cur)
-                qd3dx_cursor_apply(&f, cur, ex->inflight_cx, ex->inflight_cy, ex->cursor_save, 1);
+        /* A release can arrive while LockRect waits for the GPU. Do not
+         * publish that abandoned frame; teardown follows this command. */
+        if (!ex->release_request) {
+            d->front = i;
+            memcpy(d->front_screen, ex->inflight_screen, sizeof d->front_screen);
+            ex->shown_dev = d;
+            ex->shown_sc = ex->inflight_sc;
+            ex->shown_hidden = 0;
+            if (ex->hooks.frame) {
+                f.pixels = lr.pBits;
+                f.width = d->copy_w[i];
+                f.height = d->copy_h[i];
+                f.pitch = (uint32_t)lr.Pitch;
+                f.repeat = QD3DX_REPEAT_NONE;
+                if (cur)
+                    qd3dx_cursor_apply(&f, cur, ex->inflight_cx, ex->inflight_cy, ex->cursor_save, 0);
+                ex->hooks.frame(ex->hooks.user, &f);
+                if (cur)
+                    qd3dx_cursor_apply(&f, cur, ex->inflight_cx, ex->inflight_cy, ex->cursor_save, 1);
+            }
         }
         s->lpVtbl->UnlockRect(s);
         /* It showed the latest cursor (CURSOR_POS moves the frame in flight's). */

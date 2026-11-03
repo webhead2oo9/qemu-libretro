@@ -17,7 +17,7 @@
 #include <stdint.h>
 
 #define QD3D_MAGIC       0x44334451u /* 'QD3D' little-endian */
-#define QD3D_ABI_VERSION 3u
+#define QD3D_ABI_VERSION 4u
 
 /*
  * IID_QD3D_REMOTE {5f3e1c2a-8b47-4d16-9e03-7a51c26b8814}. Every IDirect3D9
@@ -69,45 +69,42 @@ static inline const GUID *qd3d_iid_remote(void)
  * Transports.
  *
  * Both transports offer channel slots: independent channels, each with its
- * own host executor session, one guest process per slot. A process owns a
- * slot while it holds the slot's claim, a named event it created itself
- * (CreateEvent did not report ERROR_ALREADY_EXISTS); an existing claim, or
- * one the process may not open, belongs to another live process, so the
- * slot is busy. The claim handle stays open while the process uses the
- * slot and is never inheritable. The kernel closes it when the process
- * ends, however it ends, so a dead owner's slot is free at once and the
- * next owner's HELLO releases what the dead one left on the host. Handles
- * belong to processes, not threads: no thread exit releases a slot. A
- * process that finds every slot busy uses the stock runtime.
+ * own host executor session, one guest process per slot. Ownership is held
+ * by a non-inheritable handle, so process exit gives the slot back, while
+ * thread exit does not. A process that finds every slot busy uses the stock
+ * runtime.
  *
  * Loopback (development on a Windows host, no VM): the 64-bit harness
  * creates one named file mapping of QD3D_DEFAULT_SIZE bytes per slot (at
  * most QD3D_VM_SLOTS), NAME for slot 0 and NAME_<i> for slot i > 0, and one
  * auto-reset doorbell event NAME_KICK for all of them (NAME defaults to
- * QD3D_LOOPBACK_MAPPING). Slot i's claim is NAME QD3D_LOOPBACK_SLOT_CLAIM
- * <i>. The 32-bit proxy claims the lowest free slot whose mapping exists.
- * Kick = SetEvent.
+ * QD3D_LOOPBACK_MAPPING). Slot i's claim is the named event
+ * NAME QD3D_LOOPBACK_SLOT_CLAIM <i>: CreateEvent must create it, not open
+ * an existing event. The 32-bit proxy claims the lowest free slot whose
+ * mapping exists. A dead owner's next HELLO releases its old session.
+ * Kick = SetEvent. NAME_RELEASE_<i> exercises the VM's release path.
  *
  * VM: qemu-libretro maps slot i as RAM at QD3D_VM_CHANNEL_GPA +
  * i * QD3D_VM_CHANNEL_SIZE (outside guest RAM) plus one MMIO register page
  * at QD3D_VM_MMIO_GPA; QD3D_VM_REG_SLOTS reports how many slots it serves
- * (the guest uses at most QD3D_VM_SLOTS). Slot i's claim is
- * QD3D_VM_SLOT_CLAIM <i>, in the global namespace because the slots are
- * shared by every logon session. The guest maps the register page and its
- * slot into the process with the qemu-3dfx MAPMEM driver (\\.\MAPMEM). That
- * device is exclusive: while one process has it open, every other open
- * fails with ERROR_ACCESS_DENIED whatever the share mode. So the guest
- * opens it only to map, retrying briefly while another process connects,
- * and closes it at once: the views outlive the handle, and the process
- * unmaps them itself with UnmapViewOfFile (the driver's unmap request is
- * the same ZwUnmapViewOfSection on the calling process). Kick = any 32-bit
- * write to QD3D_VM_MMIO_GPA + QD3D_VM_REG_KICK: it wakes the one executor
- * thread, which serves every slot.
+ * (the guest uses at most QD3D_VM_SLOTS). XPDriver's qxpmap.sys driver
+ * (\\.\QXPMAP, guest/qxpmap/qxpmap_ioctl.h) claims a free slot and maps
+ * only that slot and the register page into the caller. The device handle
+ * owns both mappings and the slot for its lifetime; handles may coexist.
+ * FreeLibrary sends GOODBYE, then QD3D_RELEASE and closes the handle.
+ * Process exit needs no user-mode work: the driver's cleanup unmaps,
+ * writes the slot to QD3D_VM_REG_RELEASE, then frees its ownership. The
+ * write atomically captures that slot's producer cursor; the executor ends
+ * the old session and skips only its pending packets up to that boundary.
+ * A new claimant preserves ring cursors and appends a synchronous HELLO,
+ * so packets submitted after the release boundary belong to the new owner.
+ * Teardown discards the old unfinished frame and returns the desktop if
+ * it was shown. Kick = any 32-bit write to QD3D_VM_REG_KICK: it wakes the
+ * one executor thread serving every slot.
  */
 #define QD3D_LOOPBACK_MAPPING    "Local\\QD3D_LOOPBACK"
 #define QD3D_LOOPBACK_KICK       "Local\\QD3D_LOOPBACK_KICK"
 #define QD3D_LOOPBACK_SLOT_CLAIM "_SLOT_"                /* NAME + this + slot */
-#define QD3D_VM_SLOT_CLAIM       "Global\\QD3D_VM_SLOT_" /* + slot (decimal) */
 
 #define QD3D_VM_SLOTS         4u
 #define QD3D_VM_CHANNEL_GPA   0xd0000000u /* slot i at + i * QD3D_VM_CHANNEL_SIZE */
@@ -117,6 +114,7 @@ static inline const GUID *qd3d_iid_remote(void)
 #define QD3D_VM_REG_KICK      0x000u  /* write: doorbell, every slot */
 #define QD3D_VM_REG_ID        0x004u  /* read: QD3D_MAGIC when present */
 #define QD3D_VM_REG_SLOTS     0x008u  /* read: channel slots served */
+#define QD3D_VM_REG_RELEASE   0x00cu  /* write: slot whose session ends now */
 
 /* host_state */
 #define QD3D_HOST_DOWN   0u /* executor not running; guest must not submit */

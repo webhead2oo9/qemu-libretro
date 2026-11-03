@@ -571,6 +571,8 @@ uint32_t qd3dx_live_objects(const struct qd3dx *ex)
 /* Channel                                                                  */
 /* ------------------------------------------------------------------------ */
 
+static int qd3dx_apply_release(struct qd3dx *ex);
+
 static void qd3dx_fault(struct qd3dx *ex, const struct qd3d_cmd *c, uint32_t code)
 {
     struct qd3d_ctrl *ctrl = ex->ctrl;
@@ -673,6 +675,11 @@ static int qd3dx_step(struct qd3dx *ex)
 
     head = ctrl->head;
     MemoryBarrier();
+    /* Read head BEFORE checking release: if the next owner's head is
+     * visible, the request published before its claim is visible too.
+     * A request arriving later can only race this old owner's command. */
+    if (qd3dx_apply_release(ex))
+        return 0;
     tail = ctrl->tail;
     avail = head - tail;
     if (avail == 0u)
@@ -851,20 +858,24 @@ int qd3dx_poll(struct qd3dx *ex, uint32_t budget)
 
     if (ex->trace)
         qd3dx_trace_flush(ex);
+    qd3dx_apply_release(ex);
     if (ex->faulted)
         return -1;
     qd3dx_pump(ex);
     while (n < budget) {
         int r = qd3dx_step(ex);
 
-        if (r < 0)
+        if (r < 0) {
+            if (qd3dx_apply_release(ex))
+                break;
             return -1;
+        }
         if (r == 0)
             break;
         n++;
-    }
-    if (n)
         ex->alive = 1;
+    }
+    qd3dx_apply_release(ex);
     return (int)n;
 }
 
@@ -882,11 +893,13 @@ int qd3dx_prepare_wait(struct qd3dx *ex)
 {
     struct qd3d_ctrl *ctrl = ex->ctrl;
 
+    qd3dx_apply_release(ex);
     /* The guest went quiet: show its last frame before sleeping. */
     qd3dx_present_flush(ex);
+    qd3dx_apply_release(ex);
     ctrl->host_idle = 1;
     MemoryBarrier(); /* idle store before the head load (pairs with the guest) */
-    if (!ex->faulted && ctrl->head != ctrl->tail) {
+    if (ex->release_request || (!ex->faulted && ctrl->head != ctrl->tail)) {
         ctrl->host_idle = 0;
         return 1;
     }
@@ -899,7 +912,7 @@ void qd3dx_wake(struct qd3dx *ex)
     MemoryBarrier();
 }
 
-void qd3dx_reset(struct qd3dx *ex)
+static void qd3dx_end_session(struct qd3dx *ex, uint32_t head)
 {
     struct qd3d_ctrl *ctrl = ex->ctrl;
 
@@ -907,8 +920,10 @@ void qd3dx_reset(struct qd3dx *ex)
     qd3dx_session_release(ex);
     ex->pid = 0;
     ex->faulted = 0;
+    ex->alive = 0;
+    ex->heartbeat_seen = ctrl->heartbeat;
     ex->log_budget = QD3DX_WARN_BUDGET;
-    ctrl->tail = ctrl->head;
+    ctrl->tail = head;
     ctrl->frames_done = ctrl->frames_submitted;
     ctrl->fault_op = 0;
     ctrl->fault_code = QD3D_FAULT_NONE;
@@ -916,6 +931,40 @@ void qd3dx_reset(struct qd3dx *ex)
     MemoryBarrier();
     ctrl->host_state = QD3D_HOST_READY;
     MemoryBarrier();
+}
+
+void qd3dx_request_release(struct qd3dx *ex)
+{
+    uint32_t head = ex->ctrl->head;
+
+    MemoryBarrier();
+    InterlockedExchange64(&ex->release_request, (LONG64)((1ull << 32) | head));
+}
+
+static int qd3dx_apply_release(struct qd3dx *ex)
+{
+    LONG64 request;
+
+    if (!ex->release_request)
+        return 0;
+    request = InterlockedExchange64(&ex->release_request, 0);
+    if (!request)
+        return 0;
+    qd3dx_log(ex, "qd3dx: slot release pid %u, releasing %u objects", ex->pid, qd3dx_live_objects(ex));
+    qd3dx_end_session(ex, (uint32_t)request);
+    return 1;
+}
+
+void qd3dx_reset(struct qd3dx *ex)
+{
+    uint32_t head = ex->ctrl->head;
+
+    /* Fault recovery can race the kernel freeing a slot. Read head before
+     * the release check, just as step does, and prefer the captured cut so
+     * recovery cannot swallow a new claimant's synchronous HELLO. */
+    MemoryBarrier();
+    if (!qd3dx_apply_release(ex))
+        qd3dx_end_session(ex, head);
 }
 
 uint32_t qd3dx_session_pid(const struct qd3dx *ex)

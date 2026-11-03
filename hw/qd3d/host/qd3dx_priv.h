@@ -105,6 +105,10 @@ struct qd3dx {
     uint8_t *reply;
     uint32_t reply_size;
     struct qd3dx_hooks hooks;
+    /* Cross-thread release mailbox: (1ull << 32) | captured head; 0 means
+     * none. Naturally 8-byte aligned on the Windows x64 host: ordinary
+     * volatile reads are atomic, exchange publishes/takes the whole cut. */
+    volatile LONG64 release_request;
 
     /* Private copy of the current command (TOCTOU protection). */
     uint8_t *cmdbuf;
