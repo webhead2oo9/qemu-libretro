@@ -37,6 +37,8 @@ struct AccelCPUState {
     bool interruption_pending;
     struct whpx_mmu_cache_entry mmu_cache[WHPX_MMU_CACHE_SIZE];
     unsigned mmu_cache_next;    /* round-robin eviction cursor */
+    /* -d cpu_reset: exits still to log after this processor's last reset */
+    unsigned reset_trace;
     /* Must be the last field as it may have a tail */
     WHV_RUN_VP_EXIT_CONTEXT exit_ctx;
 };

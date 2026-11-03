@@ -28,6 +28,7 @@
 #include "hw/i386/x86.h"
 #include "hw/i386/apic_internal.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qapi/error.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-visit-common.h"
@@ -522,6 +523,64 @@ static void whpx_set_legacy_fp_registers(CPUState *cpu, WHPXStateLevel level)
     }
 }
 
+/*
+ * A reset discards every event the hypervisor still holds for the
+ * processor: an interruption QEMU queued, a pending exception (SeaBIOS's
+ * qemu_reboot() executes int3 right after its 0xcf9 write, and guests'
+ * reboot fallbacks fault on purpose), the interrupt shadow and an
+ * interrupt-window request. Left in place, the first entry after the
+ * reset delivers it to the real-mode processor through whatever the old
+ * OS left in the vector table, and the firmware never runs: guest
+ * reboots hung with the virtual processors busy and no BIOS output.
+ */
+static void whpx_clear_events(CPUState *cpu)
+{
+    static const WHV_REGISTER_NAME names[] = {
+        WHvRegisterPendingInterruption,
+        WHvRegisterInterruptState,
+        WHvRegisterPendingEvent,
+        WHvX64RegisterDeliverabilityNotifications,
+    };
+    WHV_REGISTER_VALUE values[RTL_NUMBER_OF(names)] = {};
+    AccelCPUState *vcpu = cpu->accel;
+    HRESULT hr;
+
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index,
+        names, RTL_NUMBER_OF(names), values);
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to clear pending events, hr=%08lx", hr);
+    }
+
+    /* QEMU's view of the same state, as for a new processor. */
+    vcpu->interruption_pending = false;
+    vcpu->window_registered = false;
+    vcpu->ready_for_pic_interrupt = false;
+    vcpu->interruptable = true;
+    vcpu->reset_trace = 64;
+}
+
+/*
+ * A reset also ends whatever the processor was doing in the hypervisor:
+ * the bootstrap processor runs from the reset vector and an application
+ * processor waits for its SIPI. QEMU's x86 reset marks the latter halted,
+ * but with the APIC in the hypervisor that wait is the processor's
+ * StartupSuspend state, and a halt from before the reset (Windows XP ends
+ * a restart in HLT on one processor while another resets the machine)
+ * survived it: the processor never left the reset vector, every entry
+ * came back canceled, and the BIOS ran on the wrong processor or not at
+ * all. Reset only: after loadvm the saved processors keep running.
+ */
+static void whpx_reset_activity(CPUState *cpu)
+{
+    WHV_REGISTER_VALUE activity = {};
+
+    if (whpx_irqchip_in_kernel() && !cpu_is_bsp(X86_CPU(cpu))) {
+        activity.InternalActivity.StartupSuspend = 1;
+    }
+    whpx_set_reg(cpu, WHvRegisterInternalActivityState, activity);
+}
+
 void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -539,10 +598,15 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
 
     /*
      * Following MSRs have side effects on the guest or are too heavy for
-     * runtime. Limit them to full state update.
+     * runtime. Limit them to full state update. A reset also drops the
+     * pending events the register set below does not carry.
      */
     if (level >= WHPX_LEVEL_RESET_STATE) {
         whpx_set_tsc(cpu);
+        whpx_clear_events(cpu);
+    }
+    if (level == WHPX_LEVEL_RESET_STATE) {
+        whpx_reset_activity(cpu);
     }
 
     memset(&vcxt, 0, sizeof(struct whpx_register_set));
@@ -2479,6 +2543,30 @@ int whpx_vcpu_run(CPUState *cpu)
 
         whpx_vcpu_post_run(cpu);
 
+        if (vcpu->reset_trace) {
+            const WHV_RUN_VP_EXIT_CONTEXT *x = &vcpu->exit_ctx;
+            uint64_t info = 0;
+
+            vcpu->reset_trace--;
+            if (x->ExitReason == WHvRunVpExitReasonX64IoPortAccess) {
+                info = x->IoPortAccess.PortNumber;
+            } else if (x->ExitReason == WHvRunVpExitReasonMemoryAccess) {
+                info = x->MemoryAccess.Gpa;
+            }
+            qemu_log_mask(CPU_LOG_RESET,
+                          "WHPX cpu %d after reset: exit 0x%x info 0x%" PRIx64
+                          " cs %04x:%016" PRIx64 " base %016" PRIx64
+                          " rflags %08" PRIx64 " pending %u shadow %u"
+                          " irq 0x%x exitreq %d halted %d\n",
+                          cpu->cpu_index, (unsigned)x->ExitReason, info,
+                          x->VpContext.Cs.Selector, x->VpContext.Rip,
+                          x->VpContext.Cs.Base, x->VpContext.Rflags,
+                          x->VpContext.ExecutionState.InterruptionPending,
+                          x->VpContext.ExecutionState.InterruptShadow,
+                          (unsigned)qatomic_read(&cpu->interrupt_request),
+                          (int)qatomic_read(&cpu->exit_request), cpu->halted);
+        }
+
         switch (vcpu->exit_ctx.ExitReason) {
         case WHvRunVpExitReasonMemoryAccess:
             ret = whpx_handle_mmio(cpu, &vcpu->exit_ctx);
@@ -2892,6 +2980,16 @@ int whpx_vcpu_run(CPUState *cpu)
     if (--whpx->running_cpus == 0) {
         whpx_last_vcpu_stopping(cpu);
     }
+
+    /*
+     * This QEMU's common CPU loop leaves exit_request to the accelerator
+     * (KVM, NVMM and TCG clear it at the end of their run too); newer
+     * upstream clears it in common code, so the adopted upstream WHPX had
+     * dropped this. Without it, a CPU that once called cpu_exit() (every
+     * guest reset request does, through cpu_stop_current()) cancelled
+     * every later entry: guest reboots hung at the reset vector.
+     */
+    qatomic_set(&cpu->exit_request, false);
 
     return ret < 0;
 }
