@@ -480,6 +480,28 @@ static void fx_set_active(bool on)
     }
 }
 
+void qd3d_set_active(bool on)
+{
+    g_assert(bql_locked());
+    fx_set_active(on);
+    /* The device turns 3D off only when the Direct3D session is gone, so
+     * there are no more frames to wait for. */
+    if (!on && fx.sink && fx.sink->reclaim_2d) {
+        fx.sink->reclaim_2d();
+    }
+}
+
+void qd3d_publish_frame(const void *pixels, int width, int height)
+{
+    g_assert(bql_locked());
+    if (width <= 0 || height <= 0 || width > QEMU_FX_MAX_WIDTH ||
+        height > QEMU_FX_MAX_HEIGHT || !fx.sink || !fx.sink->publish) {
+        return;
+    }
+    /* The Direct3D executor reads its back buffer top-down already. */
+    fx.sink->publish(pixels, width, height, true);
+}
+
 /* Windows may return 1, 2, 3, or -1 for an unsupported extension symbol,
  * not just NULL. Treat every documented sentinel as absent before deciding
  * whether the driver supports the fenced path. */

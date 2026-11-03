@@ -565,8 +565,21 @@ typedef struct QemuFxSink {
     void (*get_guest_dims)(int *width, int *height);
     /* monotonically wrapping retro_run count; safe to read cross-thread */
     uint32_t (*get_frontend_frame_count)(void);
+    /* 3D output ended for good (not a pause between frames): show the 2D
+     * surface again at once instead of waiting out the reclaim delay.
+     * May be NULL. */
+    void (*reclaim_2d)(void);
 } QemuFxSink;
 void qemu_fx_register_sink(const QemuFxSink *sink);
+/*
+ * Direct3D 9 remoting (hw/qd3d) frame output through the registered sink.
+ * pixels: width * height * 4 bytes of top-down BGRX rows. Callers hold the
+ * BQL. No-ops until the frontend registered a sink.
+ */
+void qd3d_publish_frame(const void *pixels, int width, int height);
+/* on: frames follow. off: the Direct3D program ended; the desktop returns
+ * immediately. */
+void qd3d_set_active(bool on);
 #endif /* CONFIG_QEMU_3DFX */
 
 #ifdef CONFIG_LINUX

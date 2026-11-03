@@ -3613,6 +3613,7 @@ if have_system or have_user
     # come after subdir('target'), matching the upstream patch placement.
     subdir('hw/3dfx')
     subdir('hw/mesa')
+    subdir('hw/qd3d')
   endif
 endif
 

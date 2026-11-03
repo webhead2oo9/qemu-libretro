@@ -1095,11 +1095,20 @@ static uint32_t fx_sink_frontend_frame_count(void)
 	return qatomic_read(&frontend_frame_count);
 }
 
+// A producer ended 3D for good: let refresh() publish the 2D surface on
+// its next tick instead of standing down for FX_2D_RECLAIM_US.
+static void fx_sink_reclaim_2d(void)
+{
+	fx_last_publish_us = 0;
+	surface_damaged = true;
+}
+
 static const QemuFxSink fx_sink = {
 	.publish = fx_sink_publish,
 	.set_active = fx_sink_set_active,
 	.get_guest_dims = fx_sink_guest_dims,
 	.get_frontend_frame_count = fx_sink_frontend_frame_count,
+	.reclaim_2d = fx_sink_reclaim_2d,
 };
 #endif
 

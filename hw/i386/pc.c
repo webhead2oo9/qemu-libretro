@@ -1223,6 +1223,8 @@ void pc_basic_device_init(struct PCMachineState *pcms,
     glidept_mm_init();
     /* MESA pass-through */
     mesapt_mm_init();
+    /* Direct3D 9 remoting */
+    qd3dpt_mm_init();
 #endif
 
     /* Super I/O */
@@ -1245,6 +1247,14 @@ void mesapt_mm_init(void)
 
     sysbus_realize(SYS_BUS_DEVICE(mesapt_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(mesapt_dev), 0, MESAPT_MM_BASE);
+}
+
+void qd3dpt_mm_init(void)
+{
+    DeviceState *qd3dpt_dev = qdev_new(TYPE_QD3DPT);
+
+    sysbus_realize(SYS_BUS_DEVICE(qd3dpt_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(qd3dpt_dev), 0, QD3DPT_MM_BASE);
 }
 #endif /* CONFIG_QEMU_3DFX */
 

@@ -219,6 +219,12 @@ void glidept_mm_init(void);
 #define TYPE_MESAPT "mesapt"
 #define MESAPT_MM_BASE 0xefffe000
 void mesapt_mm_init(void);
+
+/* QD3D Direct3D 9 remoting (XPDriver qd3d/); register page after the
+ * channel slots at 0xd0000000, see hw/qd3d */
+#define TYPE_QD3DPT "qd3dpt"
+#define QD3DPT_MM_BASE 0xd8000000
+void qd3dpt_mm_init(void);
 #endif /* CONFIG_QEMU_3DFX */
 
 /* pc_sysfw.c */
