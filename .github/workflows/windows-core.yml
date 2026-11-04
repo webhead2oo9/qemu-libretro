@@ -38,8 +38,13 @@ jobs:
           submodules: false
 
       - name: Submodules
-        # Only these two; the others are not part of this build.
-        run: git submodule update --init libretro-common zlib
+        # The workspace belongs to the runner's user, the container runs as
+        # root: without this, git here and scripts/qemu-version.sh's git
+        # describe refuse the repository ("dubious ownership"). Only these two
+        # submodules; the others are not part of this build.
+        run: |
+          git config --global --add safe.directory '*'
+          git submodule update --init libretro-common zlib
 
       - name: Configure
         run: |
