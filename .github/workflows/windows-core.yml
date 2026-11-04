@@ -1,0 +1,94 @@
+# Builds the Windows x64 core of this branch (QEMU with the XPDriver devices:
+# the QD3D executor and the OpenGL passthrough) for RetroArch and EmuVR, with
+# the Windows cross-build options from README.md, and uploads it with its
+# firmware as an artifact named after the commit.
+name: Windows core
+
+on:
+  push:
+    branches: [d3d9-remoting]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history: scripts/qemu-version.sh embeds git describe.
+          fetch-depth: 0
+          submodules: false
+
+      - name: Submodules
+        # Only these two; the others are not part of this build.
+        run: git submodule update --init libretro-common zlib
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 ninja-build flex bison \
+            python3 python3-venv python3-pip pkgconf
+
+      - name: Configure
+        run: |
+          mkdir build-win64
+          cd build-win64
+          CFLAGS="-O2 -Wno-error -Wno-nested-externs -Wno-redundant-decls" ../configure \
+            --target-list=x86_64-softmmu \
+            --without-default-features \
+            --glib=internal \
+            --zlib=internal \
+            --disable-pie \
+            --enable-fdt=internal \
+            --disable-modules \
+            --disable-plugins \
+            --enable-libretro \
+            --audio-drv-list=libretro \
+            --disable-sdl \
+            --enable-slirp \
+            -Dwrap_mode=forcefallback \
+            -Db_staticpic=true \
+            --cross-prefix=x86_64-w64-mingw32- \
+            --extra-ldflags=-static \
+            --enable-whpx \
+            --enable-qemu-3dfx
+
+      - name: Build
+        run: ninja -C build-win64 libqemu_libretro.dll
+
+      - name: Package
+        run: |
+          out=qemu_xpdriver_libretro-win64
+          mkdir -p "$out/cores" "$out/system/qemu"
+          cp build-win64/libqemu_libretro.dll "$out/cores/qemu_xpdriver_libretro.dll"
+          # The firmware set the XPDriver release bundle ships.
+          for f in bios-256k.bin bios.bin efi-e1000.rom efi-e1000e.rom kvmvapic.bin \
+                   linuxboot.bin linuxboot_dma.bin multiboot.bin multiboot_dma.bin pvh.bin \
+                   vgabios-ati.bin vgabios-bochs-display.bin vgabios-cirrus.bin vgabios-qxl.bin \
+                   vgabios-ramfb.bin vgabios-stdvga.bin vgabios-virtio.bin vgabios-vmware.bin \
+                   vgabios.bin; do
+            cp "pc-bios/$f" "$out/system/qemu/"
+          done
+          cp pc-bios/README "$out/system/qemu/README.pc-bios"
+          cp COPYING LICENSE "$out/"
+          version=$(strings -n 8 "$out/cores/qemu_xpdriver_libretro.dll" | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+ \(')
+          echo "Core identity: $version"
+          { echo "qemu_xpdriver_libretro.dll $version"
+            echo "commit ${GITHUB_SHA}"
+            echo "Copy cores/ into RetroArch's cores folder and system/qemu/ into its system folder."
+            echo "EmuVR: select the core qemu_xpdriver_libretro for the game (emuvr_core.txt)."
+          } > "$out/BUILD.txt"
+          (cd "$out" && sha256sum cores/* system/qemu/* > SHA256SUMS)
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu_xpdriver_libretro-win64-${{ github.sha }}
+          path: qemu_xpdriver_libretro-win64/
+          if-no-files-found: error
