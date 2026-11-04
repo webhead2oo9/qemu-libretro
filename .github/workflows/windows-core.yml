@@ -16,8 +16,20 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # Ubuntu 26.04's mingw-w64 is the toolchain this core is built and tested
+    # with; 24.04's headers lack WHPX capability codes the WHPX code uses
+    # (WHvCapabilityCodeVmxProcbasedCtls2 and others).
+    container: ubuntu:26.04
     timeout-minutes: 120
     steps:
+      - name: Toolchain
+        # git first: without it, checkout downloads a tarball with no history.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates \
+            build-essential binutils gcc-mingw-w64-x86-64 ninja-build flex bison \
+            python3 python3-venv python3-pip pkgconf
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -28,12 +40,6 @@ jobs:
       - name: Submodules
         # Only these two; the others are not part of this build.
         run: git submodule update --init libretro-common zlib
-
-      - name: Toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 ninja-build flex bison \
-            python3 python3-venv python3-pip pkgconf
 
       - name: Configure
         run: |
